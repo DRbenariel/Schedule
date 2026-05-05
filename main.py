@@ -1,0 +1,545 @@
+"""Telegram bot entry point: handlers, scheduler, webhook server.
+
+All UI text is Hebrew. Conversation state is persisted to SQLite so a Cloud Run cold
+restart doesn't lose in-flight confirmations.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import config
+import db
+from calendar_client import CalDAVClient, format_day_summary
+from nlp import ParsedEvent, ParseError, parse_event_text
+
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------- conversation state ----------
+STATE_AWAITING_ASSIGN = "AWAITING_ASSIGN"
+STATE_AWAITING_CONFIRM = "AWAITING_CONFIRM"
+STATE_AWAITING_FORCE = "AWAITING_FORCE"
+
+# ---------- assignment choices ----------
+ASSIGN_TAL = "טל"
+ASSIGN_BEN = "בן"
+ASSIGN_BOTH = "שניהם"
+ASSIGN_LATER = "later"
+
+# ---------- callback prefixes ----------
+CB_ASSIGN = "a:"        # a:טל / a:בן / a:שניהם / a:later
+CB_CONFIRM = "c:"       # c:yes / c:no
+CB_FORCE = "f:"         # f:yes / f:no
+CB_MORNING = "m:"       # m:0 .. m:3
+CB_PENDING = "pa:"      # pa:<row_id>:<choice>  (post-creation pending assignment)
+
+# ---------- morning options ----------
+MORNING_OPTIONS = [
+    "טל מפזר/ת, בן אוסף/ת",
+    "בן מפזר/ת, טל אוסף/ת",
+    "טל גם מפזר/ת וגם אוסף/ת",
+    "בן גם מפזר/ת וגם אוסף/ת",
+]
+
+
+# ===================================================================
+# Keyboards
+# ===================================================================
+def kb_assign_select() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("טל", callback_data=f"{CB_ASSIGN}{ASSIGN_TAL}"),
+            InlineKeyboardButton("בן", callback_data=f"{CB_ASSIGN}{ASSIGN_BEN}"),
+        ],
+        [
+            InlineKeyboardButton("שניהם", callback_data=f"{CB_ASSIGN}{ASSIGN_BOTH}"),
+            InlineKeyboardButton("להחליט מאוחר", callback_data=f"{CB_ASSIGN}{ASSIGN_LATER}"),
+        ],
+    ])
+
+
+def kb_pending_select(row_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("טל", callback_data=f"{CB_PENDING}{row_id}:{ASSIGN_TAL}"),
+            InlineKeyboardButton("בן", callback_data=f"{CB_PENDING}{row_id}:{ASSIGN_BEN}"),
+        ],
+        [
+            InlineKeyboardButton("שניהם", callback_data=f"{CB_PENDING}{row_id}:{ASSIGN_BOTH}"),
+            InlineKeyboardButton("אחר כך", callback_data=f"{CB_PENDING}{row_id}:{ASSIGN_LATER}"),
+        ],
+    ])
+
+
+def kb_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ אשר", callback_data=f"{CB_CONFIRM}yes"),
+            InlineKeyboardButton("❌ בטל", callback_data=f"{CB_CONFIRM}no"),
+        ]]
+    )
+
+
+def kb_force() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("⚠️ שבץ בכל זאת", callback_data=f"{CB_FORCE}yes"),
+            InlineKeyboardButton("❌ בטל", callback_data=f"{CB_FORCE}no"),
+        ]]
+    )
+
+
+def kb_morning() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(opt, callback_data=f"{CB_MORNING}{i}")] for i, opt in enumerate(MORNING_OPTIONS)]
+    return InlineKeyboardMarkup(rows)
+
+
+# ===================================================================
+# State helpers
+# ===================================================================
+def _resolve_parent(telegram_id: int) -> str | None:
+    return config.PARENT_MAP.get(telegram_id)
+
+
+def _state_is_fresh(updated_at: str) -> bool:
+    try:
+        ts = datetime.fromisoformat(updated_at)
+    except Exception:
+        return False
+    return datetime.utcnow() - ts < timedelta(minutes=config.STATE_TIMEOUT_MINUTES)
+
+
+def _format_event_for_confirm(parsed: ParsedEvent) -> str:
+    if parsed.intent == "task":
+        return f"משימה: '{parsed.title}'"
+    if parsed.start_time:
+        date_str = parsed.start_time.strftime("%d/%m/%Y")
+        time_str = parsed.start_time.strftime("%H:%M")
+        return f"'{parsed.title}' ב-{date_str} בשעה {time_str}"
+    return f"'{parsed.title}'"
+
+
+# ===================================================================
+# Confirmation flow helpers
+# ===================================================================
+def _payload_with_pending(parsed: ParsedEvent, pending: bool) -> dict:
+    payload = parsed.to_dict()
+    payload["_pending_assignment"] = pending
+    return payload
+
+
+async def _proceed_after_parsing(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed: ParsedEvent,
+    pending: bool = False,
+) -> None:
+    """After parsing (and optional assignment selection), check conflicts and prompt."""
+    chat_id = update.effective_chat.id
+    conn: "db.sqlite3.Connection" = context.application.bot_data["db"]
+    caldav: CalDAVClient = context.application.bot_data["caldav"]
+
+    if parsed.intent == "task" or parsed.start_time is None:
+        # Tasks become all-day events. Skip conflict check.
+        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, _payload_with_pending(parsed, pending))
+        await update.effective_chat.send_message(
+            f"הבנתי: {_format_event_for_confirm(parsed)}. לשבץ ביומן?",
+            reply_markup=kb_confirm(),
+        )
+        return
+
+    end = parsed.end_time or (parsed.start_time + timedelta(hours=1))
+    try:
+        conflicts = await caldav.check_conflicts(parsed.start_time, end)
+    except Exception:
+        logger.exception("Conflict check failed")
+        conflicts = []
+
+    if conflicts:
+        names = ", ".join(c.title for c in conflicts[:3])
+        db.save_state(conn, chat_id, STATE_AWAITING_FORCE, _payload_with_pending(parsed, pending))
+        await update.effective_chat.send_message(
+            f"⚠️ שימו לב, יש התנגשות עם: {names}.\nלשבץ בכל זאת?",
+            reply_markup=kb_force(),
+        )
+    else:
+        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, _payload_with_pending(parsed, pending))
+        await update.effective_chat.send_message(
+            f"הבנתי: {_format_event_for_confirm(parsed)}. לשבץ ביומן?",
+            reply_markup=kb_confirm(),
+        )
+
+
+async def _commit_event(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed: ParsedEvent,
+    pending_assignment: bool = False,
+) -> None:
+    """Write the event to CalDAV. If `pending_assignment` is True, also insert
+    a row into `pending_assignment` so the morning trigger asks who's taking it.
+    """
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    conn = context.application.bot_data["db"]
+    caldav: CalDAVClient = context.application.bot_data["caldav"]
+
+    try:
+        if parsed.intent == "task" or parsed.start_time is None:
+            day = (parsed.start_time or datetime.now(config.TIMEZONE)).date()
+            uid = await caldav.write_all_day(parsed.title, day)
+            db.log_caldav_write(conn, uid, parsed.title, None, None, True, user_id)
+            event_date = day.isoformat()
+        else:
+            end = parsed.end_time or (parsed.start_time + timedelta(hours=1))
+            uid = await caldav.write_event(
+                parsed.title, parsed.start_time, end, parsed.recurrence_rule
+            )
+            db.log_caldav_write(
+                conn, uid, parsed.title,
+                parsed.start_time.isoformat(), end.isoformat(),
+                False, user_id,
+            )
+            event_date = parsed.start_time.date().isoformat()
+    except Exception:
+        logger.exception("CalDAV write failed")
+        await update.effective_chat.send_message("❌ שגיאה בכתיבה ליומן. נסו שוב מאוחר יותר.")
+        db.clear_state(conn, chat_id)
+        return
+
+    if pending_assignment:
+        db.add_pending_assignment(conn, uid, parsed.title, event_date, chat_id)
+
+    db.clear_state(conn, chat_id)
+    suffix = " (יישאל בבוקר מי לוקח)" if pending_assignment else ""
+    await update.effective_chat.send_message(
+        f"✅ שובץ ביומן: {_format_event_for_confirm(parsed)}{suffix}"
+    )
+
+
+# ===================================================================
+# Handlers
+# ===================================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "שלום! אני בוט לוח השנה המשפחתי.\n"
+        "שלחו לי הודעה חופשית בעברית (למשל: 'תור לרופא לעמית ביום שלישי ב-10:00')\n"
+        "ואני אשבץ ביומן Apple המשותף לאחר אישור."
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "פקודות זמינות:\n"
+        "/today — אירועי היום\n"
+        "/help — עזרה\n\n"
+        "כדי לקבוע אירוע, פשוט כתבו אותו במילים שלכם."
+    )
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    caldav: CalDAVClient = context.application.bot_data["caldav"]
+    try:
+        events = await caldav.get_today_events()
+    except Exception:
+        logger.exception("Failed to fetch today's events")
+        await update.message.reply_text("❌ לא הצלחתי לטעון את אירועי היום.")
+        return
+    summary = format_day_summary(events, datetime.now(config.TIMEZONE))
+    await update.message.reply_text(summary)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    sender_name = _resolve_parent(user.id) if user else None
+    if sender_name is None:
+        await update.message.reply_text("⚠️ המשתמש שלכם לא ממופה להורה. בדקו TAL_TELEGRAM_ID / BEN_TELEGRAM_ID.")
+        return
+
+    await update.effective_chat.send_action("typing")
+
+    try:
+        parsed = await parse_event_text(text, sender_name)
+    except ParseError:
+        logger.exception("Parse error")
+        await update.message.reply_text("❌ לא הצלחתי להבין את ההודעה. נסחו שוב בבקשה.")
+        return
+    except Exception:
+        logger.exception("Unexpected NLP error")
+        await update.message.reply_text("❌ שגיאה בעיבוד ההודעה.")
+        return
+
+    if parsed.needs_clarification:
+        await update.message.reply_text(parsed.clarification_needed or "תוכלו להבהיר את התאריך/שעה?")
+        return
+
+    conn = context.application.bot_data["db"]
+
+    # If a parent name is explicitly mentioned in the text, skip the assignment prompt.
+    # Otherwise (covers child events AND adult/family events alike) → ask.
+    if not parsed.mentioned_parents:
+        db.save_state(conn, chat_id, STATE_AWAITING_ASSIGN, parsed.to_dict())
+        if parsed.involves_children:
+            kid_str = " ו".join(parsed.involves_children)
+            prompt = f"זה אירוע של {kid_str}. מי לוקח?"
+        else:
+            prompt = "למי לשייך את האירוע?"
+        await update.message.reply_text(prompt, reply_markup=kb_assign_select())
+        return
+
+    await _proceed_after_parsing(update, context, parsed)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    chat_id = update.effective_chat.id
+    conn = context.application.bot_data["db"]
+
+    # ---------- morning answers ----------
+    if data.startswith(CB_MORNING):
+        idx = int(data[len(CB_MORNING):])
+        if 0 <= idx < len(MORNING_OPTIONS):
+            answer = MORNING_OPTIONS[idx]
+            today = datetime.now(config.TIMEZONE).date().isoformat()
+            db.save_morning_answer(conn, today, answer, update.effective_user.id if update.effective_user else 0)
+            try:
+                caldav: CalDAVClient = context.application.bot_data["caldav"]
+                await caldav.write_all_day(f"לוגיסטיקה: {answer}", datetime.now(config.TIMEZONE).date())
+            except Exception:
+                logger.exception("Logistics CalDAV write failed (non-fatal)")
+            await query.edit_message_text(f"✅ נרשם: {answer}")
+            await _send_daily_summary(context, chat_id)
+        return
+
+    # ---------- pending-assignment answers (post-creation, asked at morning trigger) ----------
+    if data.startswith(CB_PENDING):
+        await _handle_pending_callback(update, context, query, data)
+        return
+
+    # All other callbacks require a stored state.
+    state = db.load_state(conn, chat_id)
+    if not state or not _state_is_fresh(state["updated_at"]):
+        await query.edit_message_text("⏰ הפעולה פגה. שלחו את ההודעה שוב.")
+        db.clear_state(conn, chat_id)
+        return
+
+    parsed = ParsedEvent.from_dict(state["payload"])
+    pending_flag = bool(state["payload"].get("_pending_assignment", False))
+
+    # ---------- assignment selection ----------
+    if data.startswith(CB_ASSIGN):
+        choice = data[len(CB_ASSIGN):]
+        pending = False
+        if choice == ASSIGN_TAL or choice == ASSIGN_BEN:
+            parsed.title = f"{parsed.title} - {choice}"
+            await query.edit_message_text(f"שויך ל-{choice}.")
+        elif choice == ASSIGN_BOTH:
+            await query.edit_message_text("ללא שיוך מסוים (משותף).")
+        elif choice == ASSIGN_LATER:
+            pending = True
+            await query.edit_message_text("נשמור ונשאל בבוקר.")
+        else:
+            return
+        # Continue to conflict check / confirm. Carry the pending flag through state.
+        payload = parsed.to_dict()
+        payload["_pending_assignment"] = pending
+        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, payload)
+        await _proceed_after_parsing(update, context, parsed, pending=pending)
+        return
+
+    # ---------- confirm ----------
+    if data.startswith(CB_CONFIRM):
+        if data.endswith("yes"):
+            await query.edit_message_text("מעדכן יומן…")
+            await _commit_event(update, context, parsed, pending_assignment=pending_flag)
+        else:
+            db.clear_state(conn, chat_id)
+            await query.edit_message_text("❌ בוטל.")
+        return
+
+    # ---------- force on conflict ----------
+    if data.startswith(CB_FORCE):
+        if data.endswith("yes"):
+            await query.edit_message_text("מעדכן יומן למרות ההתנגשות…")
+            await _commit_event(update, context, parsed, pending_assignment=pending_flag)
+        else:
+            db.clear_state(conn, chat_id)
+            await query.edit_message_text("❌ בוטל.")
+        return
+
+
+# ===================================================================
+# Daily summary + Morning routine
+# ===================================================================
+async def _handle_pending_callback(update, context, query, data: str) -> None:
+    """Handle the morning's pending-assignment buttons. data = 'pa:<row_id>:<choice>'."""
+    conn = context.application.bot_data["db"]
+    caldav: CalDAVClient = context.application.bot_data["caldav"]
+    body = data[len(CB_PENDING):]
+    try:
+        row_id_str, choice = body.split(":", 1)
+        row_id = int(row_id_str)
+    except (ValueError, IndexError):
+        return
+
+    row = db.get_pending_by_id(conn, row_id)
+    if not row or row["resolved"]:
+        await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
+        return
+
+    if choice == ASSIGN_LATER:
+        await query.edit_message_text(f"בסדר, נשאל שוב מאוחר יותר לגבי '{row['title']}'.")
+        return
+
+    if choice in (ASSIGN_TAL, ASSIGN_BEN):
+        new_title = f"{row['title']} - {choice}"
+        ok = await caldav.update_event_title(row["event_uid"], new_title)
+        if not ok:
+            await query.edit_message_text("❌ לא הצלחתי לעדכן את היומן.")
+            return
+        db.resolve_pending(conn, row_id, choice)
+        await query.edit_message_text(f"✅ '{row['title']}' שויך ל-{choice}.")
+        return
+
+    if choice == ASSIGN_BOTH:
+        db.resolve_pending(conn, row_id, ASSIGN_BOTH)
+        await query.edit_message_text(f"✅ '{row['title']}' נותר משותף (ללא שיוך).")
+        return
+
+
+async def _ask_pending_for_date(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_date: str, day_before: bool
+) -> None:
+    conn = context.application.bot_data["db"]
+    rows = db.get_pending_for_date(conn, target_date, day_before=day_before)
+    for row in rows:
+        when = "מחר" if day_before else "היום"
+        await context.bot.send_message(
+            chat_id,
+            f"❓ {when}: '{row['title']}' — מי לוקח?",
+            reply_markup=kb_pending_select(row["id"]),
+        )
+        if day_before:
+            db.mark_asked_day_before(conn, row["id"])
+
+
+async def _send_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    caldav: CalDAVClient = context.application.bot_data["caldav"]
+    try:
+        events = await caldav.get_today_events()
+    except Exception:
+        logger.exception("Failed to fetch events for daily summary")
+        return
+    summary = format_day_summary(events, datetime.now(config.TIMEZONE))
+    await context.bot.send_message(chat_id, summary)
+
+
+async def morning_routine(application: Application) -> None:
+    chat_id = config.TELEGRAM_GROUP_CHAT_ID
+    if not chat_id:
+        logger.warning("TELEGRAM_GROUP_CHAT_ID not set — skipping morning routine")
+        return
+
+    # Pending-assignment prompts come first so they don't get drowned out by the summary.
+    today = datetime.now(config.TIMEZONE).date()
+    tomorrow = today + timedelta(days=1)
+
+    conn = application.bot_data["db"]
+    caldav = application.bot_data["caldav"]
+
+    # Lightweight wrapper to reuse _ask_pending_for_date helper signature.
+    class _Ctx:
+        bot = application.bot
+        bot_data = application.bot_data
+        application = application
+
+    await _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False)
+    await _ask_pending_for_date(_Ctx(), chat_id, tomorrow.isoformat(), day_before=True)
+
+    await application.bot.send_message(
+        chat_id,
+        "בוקר טוב! 🌅\nמי על הפיזורים והאיסופים של נועם ועמית היום?",
+        reply_markup=kb_morning(),
+    )
+
+
+# ===================================================================
+# Bootstrap
+# ===================================================================
+async def post_init(application: Application) -> None:
+    conn = db.get_connection()
+    db.init_db(conn)
+    application.bot_data["db"] = conn
+
+    caldav = CalDAVClient()
+    await caldav.connect()
+    application.bot_data["caldav"] = caldav
+
+    scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
+    scheduler.add_job(
+        morning_routine,
+        CronTrigger(hour=config.MORNING_HOUR, minute=config.MORNING_MINUTE),
+        args=[application],
+        id="morning_routine",
+        replace_existing=True,
+    )
+    scheduler.start()
+    application.bot_data["scheduler"] = scheduler
+    logger.info("Bot initialized. Morning routine at %02d:%02d Asia/Jerusalem",
+                config.MORNING_HOUR, config.MORNING_MINUTE)
+
+
+def build_application() -> Application:
+    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    return app
+
+
+def main() -> None:
+    app = build_application()
+    if config.TELEGRAM_WEBHOOK_URL:
+        logger.info("Starting in webhook mode on port %d", config.PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=config.PORT,
+            url_path="webhook",
+            webhook_url=config.TELEGRAM_WEBHOOK_URL,
+            secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+        )
+    else:
+        logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
