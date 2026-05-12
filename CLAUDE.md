@@ -9,7 +9,7 @@ Deployed on Google Cloud Run; SQLite is used only for ephemeral conversation sta
 - Python 3.12
 - `python-telegram-bot` v21+ (async, webhook mode in production / polling locally)
 - `caldav` + `icalendar` for iCloud
-- `google-generativeai` (Gemini 1.5 Flash — cheapest LLM, swappable in `nlp.py`)
+- `google-generativeai` (Gemini 2.5 Flash — latest stable Flash model, swappable via `GEMINI_MODEL` env var or `config.GEMINI_MODEL`)
 - `APScheduler` for the daily 07:00 morning routine
 - `sqlite3` (stdlib) — no migration framework, schema in `db.SCHEMA`
 
@@ -101,6 +101,19 @@ python -m venv .venv
 pip install -r requirements.txt
 cp .env.example .env      # then fill in values
 python main.py            # polling mode if TELEGRAM_WEBHOOK_URL is empty
+```
+
+### Gemini Model Selection
+Default model: `gemini-2.5-flash` (latest stable Flash). Override via `.env`:
+```
+GEMINI_MODEL=gemini-2.5-pro  # or any other available model
+```
+To list available models on your API key, run:
+```python
+import google.generativeai as genai
+genai.configure(api_key='YOUR_KEY')
+for model in genai.list_models():
+    print(model.name)
 ```
 
 ## Deploying to Cloud Run

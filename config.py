@@ -34,7 +34,7 @@ ICLOUD_CALENDAR_NAME = _required("ICLOUD_CALENDAR_NAME")
 
 # Gemini
 GEMINI_API_KEY = _required("GEMINI_API_KEY")
-GEMINI_MODEL = _optional("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = _optional("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Parent identity mapping
 TAL_TELEGRAM_ID = int(_optional("TAL_TELEGRAM_ID", "0"))
