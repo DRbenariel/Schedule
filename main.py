@@ -369,6 +369,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(prompt, reply_markup=kb_assign_select(bool(parsed.involves_children)))
             return
         both_parents = set(parsed.mentioned_parents) >= {ASSIGN_TAL, ASSIGN_BEN}
+        if both_parents and "- בן וטל" not in parsed.title:
+            parsed.title = f"{parsed.title} - בן וטל"
         await _proceed_after_parsing(update, context, parsed, childcare_needed=both_parents)
         return
 
@@ -407,6 +409,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     both_parents = set(parsed.mentioned_parents) >= {ASSIGN_TAL, ASSIGN_BEN}
+    if both_parents and "- בן וטל" not in parsed.title:
+        parsed.title = f"{parsed.title} - בן וטל"
     await _proceed_after_parsing(update, context, parsed, childcare_needed=both_parents)
 
 
