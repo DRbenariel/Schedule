@@ -1,0 +1,46 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker me-west1-docker.pkg.dev --quiet
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE="me-west1-docker.pkg.dev/gen-lang-client-0972507273/cloud-run-source-deploy/family-calendar-bot:${{ github.sha }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy family-calendar-bot \
+            --image "$IMAGE" \
+            --region me-west1 \
+            --platform managed \
+            --allow-unauthenticated \
+            --min-instances 1 \
+            --set-secrets="TELEGRAM_TOKEN=TELEGRAM_TOKEN:latest,TELEGRAM_WEBHOOK_URL=TELEGRAM_WEBHOOK_URL:latest,TELEGRAM_WEBHOOK_SECRET=TELEGRAM_WEBHOOK_SECRET:latest,TELEGRAM_GROUP_CHAT_ID=TELEGRAM_GROUP_CHAT_ID:latest,TAL_TELEGRAM_ID=TAL_TELEGRAM_ID:latest,BEN_TELEGRAM_ID=BEN_TELEGRAM_ID:latest,ICLOUD_USER=ICLOUD_USER:latest,ICLOUD_APP_PASSWORD=ICLOUD_APP_PASSWORD:latest,ICLOUD_CALENDAR_NAME=ICLOUD_CALENDAR_NAME:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest" \
+            --project gen-lang-client-0972507273 \
+            --quiet
