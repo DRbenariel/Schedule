@@ -6,7 +6,10 @@ restart doesn't lose in-flight confirmations.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -531,12 +534,33 @@ def build_application() -> Application:
     return app
 
 
+def _start_health_server() -> None:
+    """Start a minimal HTTP server for Cloud Run health checks."""
+    port = int(os.environ.get("PORT", 8080))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args):
+            pass  # suppress access logs
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health check server listening on port %d", port)
+
+
 def main() -> None:
     """Main entry point with automatic restart on crash."""
     import time
     retry_count = 0
     max_retries = 10
     retry_delay = 5  # seconds
+
+    # Health check server runs in background (required by Cloud Run)
+    _start_health_server()
 
     while True:
         try:
