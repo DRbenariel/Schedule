@@ -6,10 +6,7 @@ restart doesn't lose in-flight confirmations.
 from __future__ import annotations
 
 import logging
-import os
-import threading
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -534,38 +531,22 @@ def build_application() -> Application:
     return app
 
 
-def _start_health_server() -> None:
-    """Start a minimal HTTP server for Cloud Run health checks in a background thread."""
-    port = int(os.environ.get("PORT", 8080))
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, format, *args):
-            pass  # Suppress logging
-
-    try:
-        server = HTTPServer(("0.0.0.0", port), HealthHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True, name="HealthCheckServer")
-        thread.start()
-        logger.info("Health check server started on port %d", port)
-    except Exception as e:
-        logger.error("Failed to start health check server: %s", e, exc_info=True)
-
-
 def main() -> None:
     """Main entry point with automatic restart on crash."""
+    import os
     import time
     retry_count = 0
     max_retries = 10
     retry_delay = 5  # seconds
 
-    # Health check server runs in background (required by Cloud Run)
-    _start_health_server()
+    # On Cloud Run, webhook mode is required (run_webhook starts HTTP server on PORT).
+    # Polling mode does not open a port, so Cloud Run health checks will fail.
+    if os.environ.get("K_SERVICE") and not config.TELEGRAM_WEBHOOK_URL:
+        logger.warning(
+            "Running on Cloud Run without TELEGRAM_WEBHOOK_URL — "
+            "the container will fail Cloud Run health checks. "
+            "Set TELEGRAM_WEBHOOK_URL=https://<service-url>/webhook"
+        )
 
     while True:
         try:
