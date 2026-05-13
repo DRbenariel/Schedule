@@ -444,6 +444,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_pending_callback(update, context, query, data)
         return
 
+    # ---------- childcare callbacks — no active state needed ----------
+    if data.startswith(CB_EXT_CC):
+        body = data[len(CB_EXT_CC):]
+        try:
+            row_id_str, caregiver = body.split(":", 1)
+            row_id = int(row_id_str)
+        except (ValueError, IndexError):
+            return
+        row = db.get_pending_by_id(conn, row_id)
+        if not row or row["resolved"]:
+            await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
+            return
+        db.resolve_pending(conn, row_id, caregiver)
+        uid = row.get("event_uid", "")
+        if uid and not uid.startswith("childcare-"):
+            caldav: CalDAVClient = context.application.bot_data["caldav"]
+            await caldav.update_event_description(uid, f"בייביסיטר {caregiver}")
+        await query.edit_message_text(f"✅ {caregiver} ישמור על הילדים.")
+        return
+
+    if data.startswith(CB_CHILDCARE):
+        body = data[len(CB_CHILDCARE):]
+        try:
+            row_id_str, choice = body.split(":", 1)
+            row_id = int(row_id_str)
+        except (ValueError, IndexError):
+            return
+        row = db.get_pending_by_id(conn, row_id)
+        if not row or row["resolved"]:
+            await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
+            return
+        if choice == "later":
+            await query.edit_message_text("בסדר, תישאלו שוב ביום האירוע.")
+        return
+
     # All other callbacks require a stored state.
     state = db.load_state(conn, chat_id)
     if not state or not _state_is_fresh(state["updated_at"]):
@@ -493,44 +528,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         payload["_pending_assignment"] = pending
         db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, payload)
         await _proceed_after_parsing(update, context, parsed, pending=pending)
-        return
-
-    # ---------- childcare callbacks (after שניהם) ----------
-    if data.startswith(CB_EXT_CC):
-        body = data[len(CB_EXT_CC):]
-        try:
-            row_id_str, caregiver = body.split(":", 1)
-            row_id = int(row_id_str)
-        except (ValueError, IndexError):
-            return
-        row = db.get_pending_by_id(conn, row_id)
-        if not row or row["resolved"]:
-            await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
-            return
-        db.resolve_pending(conn, row_id, caregiver)
-        # Update iCloud event description to "בייביסיטר [name]"
-        # (only for real CalDAV events, not morning-routine placeholder UIDs)
-        uid = row.get("event_uid", "")
-        if uid and not uid.startswith("childcare-"):
-            caldav: CalDAVClient = context.application.bot_data["caldav"]
-            await caldav.update_event_description(uid, f"בייביסיטר {caregiver}")
-        await query.edit_message_text(f"✅ {caregiver} ישמור על הילדים.")
-        return
-
-    if data.startswith(CB_CHILDCARE):
-        body = data[len(CB_CHILDCARE):]
-        try:
-            row_id_str, choice = body.split(":", 1)
-            row_id = int(row_id_str)
-        except (ValueError, IndexError):
-            return
-        row = db.get_pending_by_id(conn, row_id)
-        if not row or row["resolved"]:
-            await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
-            return
-        if choice == "later":
-            await query.edit_message_text("בסדר, תישאלו שוב ביום האירוע.")
-            return
         return
 
     # ---------- confirm ----------
