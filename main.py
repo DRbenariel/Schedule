@@ -24,7 +24,7 @@ from telegram.ext import (
 import config
 import db
 from calendar_client import CalDAVClient, format_day_summary
-from nlp import ParsedEvent, ParseError, parse_event_text
+from nlp import ParsedEvent, ParseError, parse_event_text, parse_event_with_context
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
@@ -36,19 +36,23 @@ logger = logging.getLogger(__name__)
 STATE_AWAITING_ASSIGN = "AWAITING_ASSIGN"
 STATE_AWAITING_CONFIRM = "AWAITING_CONFIRM"
 STATE_AWAITING_FORCE = "AWAITING_FORCE"
+STATE_AWAITING_CLARIFICATION = "AWAITING_CLARIFICATION"
 
 # ---------- assignment choices ----------
 ASSIGN_TAL = "טל"
 ASSIGN_BEN = "בן"
 ASSIGN_BOTH = "שניהם"
 ASSIGN_LATER = "later"
+ASSIGN_OTHER = "other"
 
 # ---------- callback prefixes ----------
-CB_ASSIGN = "a:"        # a:טל / a:בן / a:שניהם / a:later
+CB_ASSIGN = "a:"        # a:טל / a:בן / a:שניהם / a:later / a:other / a:ext:<name>
 CB_CONFIRM = "c:"       # c:yes / c:no
 CB_FORCE = "f:"         # f:yes / f:no
 CB_MORNING = "m:"       # m:0 .. m:3
 CB_PENDING = "pa:"      # pa:<row_id>:<choice>  (post-creation pending assignment)
+CB_CHILDCARE = "ch:"    # ch:<row_id>:<choice>  (who's watching the kids after שניהם)
+CB_EXT_CC = "ce:"       # ce:<row_id>:<name>    (extended family childcare answer)
 
 # ---------- morning options ----------
 MORNING_OPTIONS = [
@@ -62,8 +66,8 @@ MORNING_OPTIONS = [
 # ===================================================================
 # Keyboards
 # ===================================================================
-def kb_assign_select() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def kb_assign_select(involves_children: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("טל", callback_data=f"{CB_ASSIGN}{ASSIGN_TAL}"),
             InlineKeyboardButton("בן", callback_data=f"{CB_ASSIGN}{ASSIGN_BEN}"),
@@ -72,7 +76,31 @@ def kb_assign_select() -> InlineKeyboardMarkup:
             InlineKeyboardButton("שניהם", callback_data=f"{CB_ASSIGN}{ASSIGN_BOTH}"),
             InlineKeyboardButton("להחליט מאוחר", callback_data=f"{CB_ASSIGN}{ASSIGN_LATER}"),
         ],
-    ])
+    ]
+    if involves_children:
+        rows.append([InlineKeyboardButton("אחר", callback_data=f"{CB_ASSIGN}{ASSIGN_OTHER}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_ext_assign() -> InlineKeyboardMarkup:
+    """Extended family members for initial assignment flow."""
+    names = config.EXTENDED_FAMILY
+    rows = []
+    for i in range(0, len(names), 3):
+        row = [InlineKeyboardButton(n, callback_data=f"{CB_ASSIGN}ext:{n}") for n in names[i:i+3]]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_childcare(row_id: int) -> InlineKeyboardMarkup:
+    """Who's watching the kids? (after שניהם — only extended family + defer)."""
+    names = config.EXTENDED_FAMILY
+    rows = []
+    for i in range(0, len(names), 3):
+        row = [InlineKeyboardButton(n, callback_data=f"{CB_EXT_CC}{row_id}:{n}") for n in names[i:i+3]]
+        rows.append(row)
+    rows.append([InlineKeyboardButton("להחליט מאוחר", callback_data=f"{CB_CHILDCARE}{row_id}:later")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_pending_select(row_id: int) -> InlineKeyboardMarkup:
@@ -192,9 +220,11 @@ async def _commit_event(
     context: ContextTypes.DEFAULT_TYPE,
     parsed: ParsedEvent,
     pending_assignment: bool = False,
+    childcare_needed: bool = False,
 ) -> None:
     """Write the event to CalDAV. If `pending_assignment` is True, also insert
     a row into `pending_assignment` so the morning trigger asks who's taking it.
+    If `childcare_needed` is True, ask who's watching the kids after writing.
     """
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else 0
@@ -232,6 +262,16 @@ async def _commit_event(
     await update.effective_chat.send_message(
         f"✅ שובץ ביומן: {_format_event_for_confirm(parsed)}{suffix}"
     )
+
+    # Fix 2: after writing a "שניהם" event, ask who's watching the kids
+    if childcare_needed:
+        childcare_row_id = db.add_pending_assignment(
+            conn, uid, f"שמירה: {parsed.title}", event_date, chat_id
+        )
+        await update.effective_chat.send_message(
+            "מי שומר על נועם ועמית?",
+            reply_markup=kb_childcare(childcare_row_id),
+        )
 
 
 # ===================================================================
@@ -279,7 +319,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.effective_chat.send_action("typing")
+    conn = context.application.bot_data["db"]
 
+    # ---- Fix 1: Check if we're in a clarification Q&A loop ----
+    state = db.load_state(conn, chat_id)
+    if state and state["state_name"] == STATE_AWAITING_CLARIFICATION and _state_is_fresh(state["updated_at"]):
+        payload = state["payload"]
+        original_text = payload["original_text"]
+        history: list = payload.get("history", [])
+        last_q = payload.get("last_question", "")
+        history = history + [(last_q, text)]  # append latest answer
+
+        try:
+            parsed = await parse_event_with_context(original_text, history, sender_name)
+        except ParseError:
+            await update.message.reply_text("❌ לא הצלחתי להבין. נסחו מחדש מההתחלה.")
+            db.clear_state(conn, chat_id)
+            return
+        except Exception:
+            logger.exception("Unexpected NLP error (context mode)")
+            await update.message.reply_text("❌ שגיאה בעיבוד ההודעה.")
+            return
+
+        if parsed.needs_clarification:
+            # Still unclear — save updated history and ask again
+            db.save_state(conn, chat_id, STATE_AWAITING_CLARIFICATION, {
+                "original_text": original_text,
+                "history": history,
+                "last_question": parsed.clarification_needed,
+            })
+            await update.message.reply_text(parsed.clarification_needed)
+            return
+
+        db.clear_state(conn, chat_id)
+        # Continue to assignment / confirm flow with the now-resolved event
+        if not parsed.mentioned_parents:
+            db.save_state(conn, chat_id, STATE_AWAITING_ASSIGN, parsed.to_dict())
+            if parsed.involves_children:
+                kid_str = " ו".join(parsed.involves_children)
+                prompt = f"זה אירוע של {kid_str}. מי לוקח?"
+            else:
+                prompt = "למי לשייך את האירוע?"
+            await update.message.reply_text(prompt, reply_markup=kb_assign_select(bool(parsed.involves_children)))
+            return
+        await _proceed_after_parsing(update, context, parsed)
+        return
+
+    # ---- Normal flow (no clarification state) ----
     try:
         parsed = await parse_event_text(text, sender_name)
     except ParseError:
@@ -292,10 +378,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if parsed.needs_clarification:
+        # Save clarification state so the next reply has context
+        db.save_state(conn, chat_id, STATE_AWAITING_CLARIFICATION, {
+            "original_text": text,
+            "history": [],
+            "last_question": parsed.clarification_needed,
+        })
         await update.message.reply_text(parsed.clarification_needed or "תוכלו להבהיר את התאריך/שעה?")
         return
-
-    conn = context.application.bot_data["db"]
 
     # If a parent name is explicitly mentioned in the text, skip the assignment prompt.
     # Otherwise (covers child events AND adult/family events alike) → ask.
@@ -306,7 +396,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             prompt = f"זה אירוע של {kid_str}. מי לוקח?"
         else:
             prompt = "למי לשייך את האירוע?"
-        await update.message.reply_text(prompt, reply_markup=kb_assign_select())
+        await update.message.reply_text(prompt, reply_markup=kb_assign_select(bool(parsed.involves_children)))
         return
 
     await _proceed_after_parsing(update, context, parsed)
@@ -351,21 +441,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     parsed = ParsedEvent.from_dict(state["payload"])
     pending_flag = bool(state["payload"].get("_pending_assignment", False))
+    childcare_flag = bool(state["payload"].get("_childcare_needed", False))
 
     # ---------- assignment selection ----------
     if data.startswith(CB_ASSIGN):
         choice = data[len(CB_ASSIGN):]
         pending = False
+
         if choice == ASSIGN_TAL or choice == ASSIGN_BEN:
             parsed.title = f"{parsed.title} - {choice}"
             await query.edit_message_text(f"שויך ל-{choice}.")
+
         elif choice == ASSIGN_BOTH:
-            await query.edit_message_text("ללא שיוך מסוים (משותף).")
+            # Fix 2: append "- בן וטל" to title + flag childcare needed
+            parsed.title = f"{parsed.title} - בן וטל"
+            payload = parsed.to_dict()
+            payload["_pending_assignment"] = False
+            payload["_childcare_needed"] = True
+            db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, payload)
+            await query.edit_message_text("שניהם. ממשיך לאישור.")
+            await _proceed_after_parsing(update, context, parsed, pending=False)
+            return
+
         elif choice == ASSIGN_LATER:
             pending = True
             await query.edit_message_text("נשמור ונשאל בבוקר.")
+
+        elif choice == ASSIGN_OTHER:
+            # Fix 3: show extended family keyboard
+            await query.edit_message_reply_markup(reply_markup=kb_ext_assign())
+            return
+
+        elif choice.startswith("ext:"):
+            # Fix 3: extended family member selected
+            caregiver = choice[4:]
+            parsed.title = f"{parsed.title} - {caregiver}"
+            await query.edit_message_text(f"שויך ל-{caregiver}.")
+
         else:
             return
+
         # Continue to conflict check / confirm. Carry the pending flag through state.
         payload = parsed.to_dict()
         payload["_pending_assignment"] = pending
@@ -373,11 +488,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _proceed_after_parsing(update, context, parsed, pending=pending)
         return
 
+    # ---------- childcare callbacks (after שניהם) ----------
+    if data.startswith(CB_EXT_CC):
+        body = data[len(CB_EXT_CC):]
+        try:
+            row_id_str, caregiver = body.split(":", 1)
+            row_id = int(row_id_str)
+        except (ValueError, IndexError):
+            return
+        row = db.get_pending_by_id(conn, row_id)
+        if not row or row["resolved"]:
+            await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
+            return
+        db.resolve_pending(conn, row_id, caregiver)
+        await query.edit_message_text(f"✅ {caregiver} ישמור על הילדים.")
+        return
+
+    if data.startswith(CB_CHILDCARE):
+        body = data[len(CB_CHILDCARE):]
+        try:
+            row_id_str, choice = body.split(":", 1)
+            row_id = int(row_id_str)
+        except (ValueError, IndexError):
+            return
+        row = db.get_pending_by_id(conn, row_id)
+        if not row or row["resolved"]:
+            await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
+            return
+        if choice == "later":
+            await query.edit_message_text("בסדר, תישאלו שוב ביום האירוע.")
+            return
+        return
+
     # ---------- confirm ----------
     if data.startswith(CB_CONFIRM):
         if data.endswith("yes"):
             await query.edit_message_text("מעדכן יומן…")
-            await _commit_event(update, context, parsed, pending_assignment=pending_flag)
+            await _commit_event(update, context, parsed, pending_assignment=pending_flag, childcare_needed=childcare_flag)
         else:
             db.clear_state(conn, chat_id)
             await query.edit_message_text("❌ בוטל.")
@@ -387,7 +534,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith(CB_FORCE):
         if data.endswith("yes"):
             await query.edit_message_text("מעדכן יומן למרות ההתנגשות…")
-            await _commit_event(update, context, parsed, pending_assignment=pending_flag)
+            await _commit_event(update, context, parsed, pending_assignment=pending_flag, childcare_needed=childcare_flag)
         else:
             db.clear_state(conn, chat_id)
             await query.edit_message_text("❌ בוטל.")

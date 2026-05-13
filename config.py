@@ -48,6 +48,7 @@ if BEN_TELEGRAM_ID:
 
 PARENTS = ["טל", "בן"]
 CHILDREN = ["נועם", "עמית"]
+EXTENDED_FAMILY = ["דנה", "טלילה", "מאיר", "גל", "יוני", "תם", "שיר"]
 
 # Timezone
 TIMEZONE = pytz.timezone("Asia/Jerusalem")

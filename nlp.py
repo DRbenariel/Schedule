@@ -131,6 +131,23 @@ def _build_prompt(text: str, sender_name: str) -> str:
     )
 
 
+def _build_prompt_with_context(
+    original_text: str,
+    history: list[tuple[str, str]],
+    sender_name: str,
+) -> str:
+    """Build a prompt that includes the full clarification Q&A history."""
+    history_lines = "".join(
+        f"\nבוט שאל: {q}\nמשתמש ענה: {a}" for q, a in history
+    )
+    full_text = (
+        f"הודעה מקורית: {original_text}"
+        f"{history_lines}"
+        f"\n\nיש לך את כל המידע הדרוש. אל תשאל שאלות נוספות — החזר JSON מלא לאירוע."
+    )
+    return _build_prompt(full_text, sender_name)
+
+
 def _strip_json(raw: str) -> str:
     """Strip markdown fences if present (Gemini occasionally adds them)."""
     raw = raw.strip()
@@ -150,6 +167,46 @@ async def _call_gemini(prompt: str) -> str:
     except Exception as exc:
         logger.exception("Gemini call failed")
         raise LLMError(str(exc)) from exc
+
+
+async def parse_event_with_context(
+    original_text: str,
+    history: list[tuple[str, str]],
+    sender_name: str,
+) -> ParsedEvent:
+    """Re-parse with full clarification history. Same return contract as parse_event_text."""
+    prompt = _build_prompt_with_context(original_text, history, sender_name)
+    raw_response = await _call_gemini(prompt)
+    try:
+        data = json.loads(_strip_json(raw_response))
+    except json.JSONDecodeError:
+        retry_prompt = prompt + "\n\nתשובתך הקודמת לא הייתה JSON תקין. החזר JSON תקין בלבד."
+        raw_response = await _call_gemini(retry_prompt)
+        try:
+            data = json.loads(_strip_json(raw_response))
+        except json.JSONDecodeError as exc:
+            raise ParseError(f"Gemini returned non-JSON twice: {raw_response!r}") from exc
+
+    if "clarification_needed" in data and data["clarification_needed"]:
+        # Still unclear even with context — treat as another clarification round
+        return ParsedEvent(
+            title="", start_time=None, end_time=None,
+            is_recurring=False, recurrence_rule=None,
+            involves_children=[], mentioned_parents=[],
+            intent="event", clarification_needed=data["clarification_needed"], raw=data,
+        )
+
+    try:
+        parsed = ParsedEvent.from_dict(data)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ParseError(f"Invalid ParsedEvent payload: {data!r}") from exc
+
+    parsed.involves_children = [c for c in parsed.involves_children if c in config.CHILDREN]
+    parsed.mentioned_parents = [p for p in parsed.mentioned_parents if p in config.PARENTS]
+    if parsed.intent not in ("event", "task"):
+        parsed.intent = "event"
+    parsed.raw = data
+    return parsed
 
 
 async def parse_event_text(text: str, sender_name: str) -> ParsedEvent:
