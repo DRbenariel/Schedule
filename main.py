@@ -501,6 +501,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text("⏰ הפעולה כבר נסגרה.")
             return
         db.resolve_pending(conn, row_id, caregiver)
+        # Update iCloud event description to "בייביסיטר [name]"
+        # (only for real CalDAV events, not morning-routine placeholder UIDs)
+        uid = row.get("event_uid", "")
+        if uid and not uid.startswith("childcare-"):
+            caldav: CalDAVClient = context.application.bot_data["caldav"]
+            await caldav.update_event_description(uid, f"בייביסיטר {caregiver}")
         await query.edit_message_text(f"✅ {caregiver} ישמור על הילדים.")
         return
 
@@ -580,6 +586,72 @@ async def _handle_pending_callback(update, context, query, data: str) -> None:
         return
 
 
+def _to_aware(dt: "datetime | date") -> datetime:
+    """Ensure a datetime or date is timezone-aware in the project timezone."""
+    from datetime import date as date_type
+    if isinstance(dt, datetime):
+        return dt if dt.tzinfo else config.TIMEZONE.localize(dt)
+    return config.TIMEZONE.localize(datetime.combine(dt, datetime.min.time()))
+
+
+async def _check_parents_overlap(
+    application: Application, chat_id: int, today: "date"
+) -> None:
+    """Detect overlapping parent events today and ask childcare question if needed."""
+    from datetime import date as date_type
+    caldav: CalDAVClient = application.bot_data["caldav"]
+    conn = application.bot_data["db"]
+
+    day_start = _to_aware(today)
+    day_end = day_start + timedelta(days=1)
+
+    try:
+        events = await caldav.get_events_for_range(day_start, day_end)
+    except Exception:
+        logger.exception("Failed to fetch events for overlap check")
+        return
+
+    # Skip all-day events; collect timed events per parent
+    ben_slots, tal_slots = [], []
+    for ev in events:
+        if ev.is_all_day or not ev.start:
+            continue
+        s = _to_aware(ev.start)
+        e = _to_aware(ev.end) if ev.end else s + timedelta(hours=1)
+        if "- בן" in ev.title or "- בן וטל" in ev.title:
+            ben_slots.append((s, e))
+        if "- טל" in ev.title or "- בן וטל" in ev.title:
+            tal_slots.append((s, e))
+
+    # Check for any overlap between בן and טל
+    overlap_found = any(
+        bs < te and be > ts
+        for bs, be in ben_slots
+        for ts, te in tal_slots
+    )
+    if not overlap_found:
+        return
+
+    # Avoid asking twice on the same day
+    existing = db.get_pending_for_date(conn, today.isoformat(), day_before=False)
+    if any("שמירה:" in r["title"] for r in existing):
+        return
+
+    # Create a pending_assignment row so the answer is tracked
+    row_id = db.add_pending_assignment(
+        conn,
+        f"childcare-{today.isoformat()}",
+        f"שמירה: שני ההורים עסוקים",
+        today.isoformat(),
+        chat_id,
+    )
+    await application.bot.send_message(
+        chat_id,
+        "🧒 שני ההורים עסוקים בו-זמנית היום — מי שומר על נועם ועמית?",
+        reply_markup=kb_childcare(row_id),
+    )
+
+
 async def _ask_pending_for_date(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_date: str, day_before: bool
 ) -> None:
@@ -587,11 +659,20 @@ async def _ask_pending_for_date(
     rows = db.get_pending_for_date(conn, target_date, day_before=day_before)
     for row in rows:
         when = "מחר" if day_before else "היום"
-        await context.bot.send_message(
-            chat_id,
-            f"❓ {when}: '{row['title']}' — מי לוקח?",
-            reply_markup=kb_pending_select(row["id"]),
-        )
+        # Childcare rows use a different keyboard and wording
+        if row["title"].startswith("שמירה:"):
+            event_desc = row["title"][6:].strip()
+            await context.bot.send_message(
+                chat_id,
+                f"🧒 {when}: {event_desc} — מי שומר על נועם ועמית?",
+                reply_markup=kb_childcare(row["id"]),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"❓ {when}: '{row['title']}' — מי לוקח?",
+                reply_markup=kb_pending_select(row["id"]),
+            )
         if day_before:
             db.mark_asked_day_before(conn, row["id"])
 
@@ -628,6 +709,9 @@ async def morning_routine(application: Application) -> None:
 
     await _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False)
     await _ask_pending_for_date(_Ctx(), chat_id, tomorrow.isoformat(), day_before=True)
+
+    # Check if both parents have overlapping events today → ask childcare
+    await _check_parents_overlap(application, chat_id, today)
 
     await application.bot.send_message(
         chat_id,

@@ -125,6 +125,7 @@ class CalDAVClient:
         end: datetime | None,
         is_all_day: bool,
         recurrence_rule: str | None,
+        description: str | None = None,
     ) -> str:
         cal = self._ensure_connected()
         uid = str(uuid.uuid4())
@@ -150,6 +151,9 @@ class CalDAVClient:
             if rrule_dict:
                 event.add("rrule", rrule_dict)
 
+        if description:
+            event.add("description", description)
+
         ical.add_component(event)
         cal.add_event(ical.to_ical().decode("utf-8"))
         return uid
@@ -160,14 +164,15 @@ class CalDAVClient:
         start: datetime,
         end: datetime | None = None,
         recurrence_rule: str | None = None,
+        description: str | None = None,
     ) -> str:
         return await asyncio.to_thread(
-            self._write_event_sync, title, start, end, False, recurrence_rule
+            self._write_event_sync, title, start, end, False, recurrence_rule, description
         )
 
-    async def write_all_day(self, title: str, day: date) -> str:
+    async def write_all_day(self, title: str, day: date, description: str | None = None) -> str:
         return await asyncio.to_thread(
-            self._write_event_sync, title, datetime.combine(day, datetime.min.time()), None, True, None
+            self._write_event_sync, title, datetime.combine(day, datetime.min.time()), None, True, None, description
         )
 
     # --------- update ---------
@@ -195,6 +200,30 @@ class CalDAVClient:
 
     async def update_event_title(self, uid: str, new_title: str) -> bool:
         return await asyncio.to_thread(self._update_title_sync, uid, new_title)
+
+    def _update_description_sync(self, uid: str, description: str) -> bool:
+        cal = self._ensure_connected()
+        try:
+            event = cal.event_by_uid(uid)
+        except Exception:
+            logger.warning("Event UID %s not found for description update", uid)
+            return False
+        try:
+            ical = ICal.from_ical(event.data)
+            for component in ical.walk("VEVENT"):
+                if str(component.get("uid", "")) == uid:
+                    if "description" in component:
+                        del component["description"]
+                    component.add("description", description)
+            event.data = ical.to_ical().decode("utf-8")
+            event.save()
+            return True
+        except Exception:
+            logger.exception("Failed to update description for UID %s", uid)
+            return False
+
+    async def update_event_description(self, uid: str, description: str) -> bool:
+        return await asyncio.to_thread(self._update_description_sync, uid, description)
 
 
 # --------- helpers ---------
