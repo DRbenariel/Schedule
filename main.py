@@ -178,15 +178,21 @@ async def _proceed_after_parsing(
     context: ContextTypes.DEFAULT_TYPE,
     parsed: ParsedEvent,
     pending: bool = False,
+    childcare_needed: bool = False,
 ) -> None:
     """After parsing (and optional assignment selection), check conflicts and prompt."""
     chat_id = update.effective_chat.id
     conn: "db.sqlite3.Connection" = context.application.bot_data["db"]
     caldav: CalDAVClient = context.application.bot_data["caldav"]
 
+    def _make_payload() -> dict:
+        p = _payload_with_pending(parsed, pending)
+        p["_childcare_needed"] = childcare_needed
+        return p
+
     if parsed.intent == "task" or parsed.start_time is None:
         # Tasks become all-day events. Skip conflict check.
-        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, _payload_with_pending(parsed, pending))
+        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, _make_payload())
         await update.effective_chat.send_message(
             f"הבנתי: {_format_event_for_confirm(parsed)}. לשבץ ביומן?",
             reply_markup=kb_confirm(),
@@ -202,13 +208,13 @@ async def _proceed_after_parsing(
 
     if conflicts:
         names = ", ".join(c.title for c in conflicts[:3])
-        db.save_state(conn, chat_id, STATE_AWAITING_FORCE, _payload_with_pending(parsed, pending))
+        db.save_state(conn, chat_id, STATE_AWAITING_FORCE, _make_payload())
         await update.effective_chat.send_message(
             f"⚠️ שימו לב, יש התנגשות עם: {names}.\nלשבץ בכל זאת?",
             reply_markup=kb_force(),
         )
     else:
-        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, _payload_with_pending(parsed, pending))
+        db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, _make_payload())
         await update.effective_chat.send_message(
             f"הבנתי: {_format_event_for_confirm(parsed)}. לשבץ ביומן?",
             reply_markup=kb_confirm(),
@@ -362,7 +368,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 prompt = "למי לשייך את האירוע?"
             await update.message.reply_text(prompt, reply_markup=kb_assign_select(bool(parsed.involves_children)))
             return
-        await _proceed_after_parsing(update, context, parsed)
+        both_parents = set(parsed.mentioned_parents) >= {ASSIGN_TAL, ASSIGN_BEN}
+        await _proceed_after_parsing(update, context, parsed, childcare_needed=both_parents)
         return
 
     # ---- Normal flow (no clarification state) ----
@@ -399,7 +406,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(prompt, reply_markup=kb_assign_select(bool(parsed.involves_children)))
         return
 
-    await _proceed_after_parsing(update, context, parsed)
+    both_parents = set(parsed.mentioned_parents) >= {ASSIGN_TAL, ASSIGN_BEN}
+    await _proceed_after_parsing(update, context, parsed, childcare_needed=both_parents)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -453,14 +461,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(f"שויך ל-{choice}.")
 
         elif choice == ASSIGN_BOTH:
-            # Fix 2: append "- בן וטל" to title + flag childcare needed
             parsed.title = f"{parsed.title} - בן וטל"
-            payload = parsed.to_dict()
-            payload["_pending_assignment"] = False
-            payload["_childcare_needed"] = True
-            db.save_state(conn, chat_id, STATE_AWAITING_CONFIRM, payload)
             await query.edit_message_text("שניהם. ממשיך לאישור.")
-            await _proceed_after_parsing(update, context, parsed, pending=False)
+            await _proceed_after_parsing(update, context, parsed, pending=False, childcare_needed=True)
             return
 
         elif choice == ASSIGN_LATER:
