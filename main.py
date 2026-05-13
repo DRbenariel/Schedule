@@ -515,8 +515,14 @@ async def post_init(application: Application) -> None:
                 config.MORNING_HOUR, config.MORNING_MINUTE)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log unhandled errors and continue (don't crash on network errors)."""
+    logger.error("Update %s caused error %s", update, context.error, exc_info=context.error)
+
+
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
@@ -526,19 +532,39 @@ def build_application() -> Application:
 
 
 def main() -> None:
-    app = build_application()
-    if config.TELEGRAM_WEBHOOK_URL:
-        logger.info("Starting in webhook mode on port %d", config.PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=config.PORT,
-            url_path="webhook",
-            webhook_url=config.TELEGRAM_WEBHOOK_URL,
-            secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
-        )
-    else:
-        logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    """Main entry point with automatic restart on crash."""
+    import time
+    retry_count = 0
+    max_retries = 10
+    retry_delay = 5  # seconds
+
+    while True:
+        try:
+            app = build_application()
+            if config.TELEGRAM_WEBHOOK_URL:
+                logger.info("Starting in webhook mode on port %d", config.PORT)
+                app.run_webhook(
+                    listen="0.0.0.0",
+                    port=config.PORT,
+                    url_path="webhook",
+                    webhook_url=config.TELEGRAM_WEBHOOK_URL,
+                    secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+                )
+            else:
+                logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
+                app.run_polling(allowed_updates=Update.ALL_TYPES)
+            # If we reach here, polling/webhook stopped normally
+            break
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            break
+        except Exception as e:
+            retry_count += 1
+            logger.error("Bot crashed: %s (retry %d/%d in %ds)", e, retry_count, max_retries, retry_delay)
+            if retry_count > max_retries:
+                logger.critical("Max retries exceeded, giving up")
+                raise
+            time.sleep(retry_delay)
 
 
 if __name__ == "__main__":
