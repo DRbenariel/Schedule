@@ -300,6 +300,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_testmorning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: manually trigger the morning routine right now."""
+    await update.message.reply_text("🔧 מפעיל רוטינת בוקר לבדיקה…")
+    await morning_routine(context.application)
+
+
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caldav: CalDAVClient = context.application.bot_data["caldav"]
     try:
@@ -746,8 +752,12 @@ async def post_init(application: Application) -> None:
     )
     scheduler.start()
     application.bot_data["scheduler"] = scheduler
-    logger.info("Bot initialized. Morning routine at %02d:%02d Asia/Jerusalem",
-                config.MORNING_HOUR, config.MORNING_MINUTE)
+    logger.info(
+        "Bot initialized. Morning routine scheduled at %02d:%02d Asia/Jerusalem. "
+        "Next fire: %s",
+        config.MORNING_HOUR, config.MORNING_MINUTE,
+        scheduler.get_job("morning_routine").next_run_time,
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,6 +771,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("testmorning", cmd_testmorning))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
