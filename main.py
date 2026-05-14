@@ -769,11 +769,12 @@ async def morning_routine(application: Application) -> None:
     # Check if both parents have overlapping events today → ask childcare
     await _check_parents_overlap(application, chat_id, today)
 
-    await application.bot.send_message(
-        chat_id,
-        "בוקר טוב! 🌅\nמי על הפיזורים והאיסופים של נועם ועמית היום?",
-        reply_markup=kb_morning(),
-    )
+    # Send today's calendar summary
+    class _Ctx2:
+        bot = application.bot
+        bot_data = application.bot_data
+        application = application
+    await _send_daily_summary(_Ctx2(), chat_id)
 
 
 # ===================================================================

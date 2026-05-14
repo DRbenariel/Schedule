@@ -121,7 +121,21 @@ class CalDAVClient:
         now = datetime.now(config.TIMEZONE)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
-        return await self.get_events_for_range(start, end)
+        events = await self.get_events_for_range(start, end)
+        # iCloud sometimes returns events from the previous evening (UTC bleed).
+        # Filter to only events that START on today's date in the project timezone.
+        today = now.date()
+        filtered = []
+        for ev in events:
+            if ev.is_all_day:
+                filtered.append(ev)
+                continue
+            if ev.start is None:
+                continue
+            ev_start_local = _ensure_aware(ev.start).astimezone(config.TIMEZONE)
+            if ev_start_local.date() == today:
+                filtered.append(ev)
+        return filtered
 
     # --------- write ---------
 
@@ -282,9 +296,9 @@ def format_event_line(ev: CalEvent) -> str:
 
 def format_day_summary(events: list[CalEvent], day: datetime) -> str:
     weekday = HEB_DAYS[day.weekday()]
-    header = f"📅 {weekday}, {day.strftime('%d/%m/%Y')}"
+    header = f"בוקר טוב! הנה הלו\"ז להיום 📅\n{weekday}, {day.strftime('%d/%m/%Y')}"
     if not events:
-        return f"{header}\n\n אין אירועים מתוכננים להיום."
+        return f"{header}\n\nאין אירועים מתוכננים להיום."
     sorted_events = sorted(
         events,
         key=lambda e: (_ensure_aware(e.start) if e.start else datetime.max.replace(tzinfo=config.TIMEZONE)),
