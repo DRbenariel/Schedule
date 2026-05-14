@@ -302,9 +302,45 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_testmorning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin: manually trigger the morning routine right now."""
-    await update.message.reply_text("🔧 מפעיל רוטינת בוקר לבדיקה…")
-    await morning_routine(context.application)
+    """Admin: manually trigger the morning routine right now, with step-by-step logging."""
+    chat_id = update.effective_chat.id
+    app = context.application
+    conn = app.bot_data["db"]
+    caldav: CalDAVClient = app.bot_data["caldav"]
+    today = datetime.now(config.TIMEZONE).date()
+
+    await update.message.reply_text("🔧 שלב 1: בודק pending assignments…")
+    try:
+        class _Ctx:
+            bot = app.bot
+            bot_data = app.bot_data
+            application = app
+        await asyncio.wait_for(
+            _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False), timeout=10.0
+        )
+        await update.message.reply_text("✅ שלב 1 הושלם.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ שלב 1 נכשל: {e}")
+
+    await update.message.reply_text("🔧 שלב 2: בודק חפיפה בין הורים ביומן…")
+    try:
+        await asyncio.wait_for(_check_parents_overlap(app, chat_id, today), timeout=25.0)
+        await update.message.reply_text("✅ שלב 2 הושלם.")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏰ שלב 2 timeout — בעיה בחיבור iCloud.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ שלב 2 נכשל: {e}")
+
+    await update.message.reply_text("🔧 שלב 3: שולח הודעת בוקר…")
+    try:
+        await app.bot.send_message(
+            config.TELEGRAM_GROUP_CHAT_ID,
+            "בוקר טוב! 🌅\nמי על הפיזורים והאיסופים של נועם ועמית היום?",
+            reply_markup=kb_morning(),
+        )
+        await update.message.reply_text("✅ שלב 3 הושלם — רוטינת הבוקר עבדה!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ שלב 3 נכשל: {e}")
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
