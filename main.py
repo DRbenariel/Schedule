@@ -769,6 +769,14 @@ async def morning_routine(application: Application) -> None:
     # Check if both parents have overlapping events today → ask childcare
     await _check_parents_overlap(application, chat_id, today)
 
+    # Logistics question — skip on Saturday (no school)
+    if today.weekday() != 5:  # 5 = Saturday
+        await application.bot.send_message(
+            chat_id,
+            "מי על הפיזורים והאיסופים של נועם ועמית היום?",
+            reply_markup=kb_morning(),
+        )
+
     # Send today's calendar summary
     class _Ctx2:
         bot = application.bot
