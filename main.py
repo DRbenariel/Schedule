@@ -5,6 +5,7 @@ restart doesn't lose in-flight confirmations.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -616,7 +617,12 @@ async def _check_parents_overlap(
     day_end = day_start + timedelta(days=1)
 
     try:
-        events = await caldav.get_events_for_range(day_start, day_end)
+        events = await asyncio.wait_for(
+            caldav.get_events_for_range(day_start, day_end), timeout=20.0
+        )
+    except asyncio.TimeoutError:
+        logger.warning("CalDAV timeout during overlap check — skipping")
+        return
     except Exception:
         logger.exception("Failed to fetch events for overlap check")
         return
@@ -690,7 +696,11 @@ async def _ask_pending_for_date(
 async def _send_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     caldav: CalDAVClient = context.application.bot_data["caldav"]
     try:
-        events = await caldav.get_today_events()
+        events = await asyncio.wait_for(caldav.get_today_events(), timeout=20.0)
+    except asyncio.TimeoutError:
+        logger.warning("CalDAV timeout fetching daily summary")
+        await context.bot.send_message(chat_id, "⚠️ לא הצלחתי לטעון את אירועי היום (timeout).")
+        return
     except Exception:
         logger.exception("Failed to fetch events for daily summary")
         return

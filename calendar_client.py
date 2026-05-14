@@ -69,8 +69,15 @@ class CalDAVClient:
     # --------- read ---------
 
     def _get_events_sync(self, start: datetime, end: datetime) -> list[CalEvent]:
-        cal = self._ensure_connected()
-        results = cal.date_search(start=start, end=end, expand=True)
+        try:
+            cal = self._ensure_connected()
+            results = cal.date_search(start=start, end=end, expand=True)
+        except Exception:
+            # Stale connection — reconnect once and retry
+            logger.warning("CalDAV connection stale, reconnecting…")
+            self._connect_sync()
+            cal = self._ensure_connected()
+            results = cal.date_search(start=start, end=end, expand=True)
         events: list[CalEvent] = []
         for item in results:
             try:
