@@ -749,9 +749,13 @@ async def morning_routine(application: Application) -> None:
     if not chat_id:
         logger.warning("TELEGRAM_GROUP_CHAT_ID not set — skipping morning routine")
         return
-
-    # Pending-assignment prompts come first so they don't get drowned out by the summary.
+    conn = application.bot_data["db"]
     today = datetime.now(config.TIMEZONE).date()
+    if db.morning_ran_today(conn, today.isoformat()):
+        logger.info("Morning routine already ran today (%s), skipping.", today)
+        return
+    db.log_morning_run(conn, today.isoformat())
+
     tomorrow = today + timedelta(days=1)
 
     conn = application.bot_data["db"]
@@ -813,6 +817,13 @@ async def post_init(application: Application) -> None:
         config.MORNING_HOUR, config.MORNING_MINUTE,
         scheduler.get_job("morning_routine").next_run_time,
     )
+
+    # Catch-up: if the container restarted after 7am and the routine hasn't run yet today, run it now.
+    now = datetime.now(config.TIMEZONE)
+    morning_cutoff = now.replace(hour=config.MORNING_HOUR, minute=config.MORNING_MINUTE, second=0, microsecond=0)
+    if now >= morning_cutoff and not db.morning_ran_today(conn, now.date().isoformat()):
+        logger.warning("Container started after morning routine window — running catch-up now.")
+        await morning_routine(application)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
