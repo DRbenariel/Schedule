@@ -284,6 +284,20 @@ async def _commit_event(
 # ===================================================================
 # Handlers
 # ===================================================================
+async def cmd_cron_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Triggered by GitHub Actions at 7am. Validates secret then runs morning routine."""
+    args = context.args or []
+    secret = args[0] if args else ""
+    if config.CRON_SECRET and secret != config.CRON_SECRET:
+        logger.warning("Unauthorized /cron_morning attempt")
+        return
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await morning_routine(context.application)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "שלום! אני בוט לוח השנה המשפחתי.\n"
@@ -829,6 +843,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("cron_morning", cmd_cron_morning))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
