@@ -63,7 +63,8 @@ class CalDAVClient:
 
     def _ensure_connected(self) -> caldav.Calendar:
         if self._calendar is None:
-            raise RuntimeError("CalDAV client is not connected. Call connect() first.")
+            logger.info("CalDAV not connected — connecting now.")
+            self._connect_sync()
         return self._calendar
 
     # --------- read ---------
