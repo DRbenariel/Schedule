@@ -9,12 +9,6 @@ from typing import Any
 import config
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS morning_log (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_date TEXT NOT NULL UNIQUE,   -- YYYY-MM-DD
-    ran_at   TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS conversation_state (
     chat_id      INTEGER PRIMARY KEY,
     state_name   TEXT NOT NULL,
@@ -202,23 +196,6 @@ def resolve_pending(conn: sqlite3.Connection, row_id: int, resolved_to: str) -> 
         (resolved_to, row_id),
     )
     conn.commit()
-
-
-# ---------- morning_log ----------
-
-def log_morning_run(conn: sqlite3.Connection, run_date: str) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO morning_log (run_date, ran_at) VALUES (?, ?)",
-        (run_date, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-
-
-def morning_ran_today(conn: sqlite3.Connection, run_date: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM morning_log WHERE run_date = ?", (run_date,)
-    ).fetchone()
-    return row is not None
 
 
 # ---------- caldav_write_log ----------
