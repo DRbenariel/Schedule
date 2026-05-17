@@ -749,44 +749,69 @@ async def morning_routine(application: Application) -> None:
     if not chat_id:
         logger.warning("TELEGRAM_GROUP_CHAT_ID not set — skipping morning routine")
         return
+
     conn = application.bot_data["db"]
     today = datetime.now(config.TIMEZONE).date()
+    tomorrow = today + timedelta(days=1)
+
     if db.morning_ran_today(conn, today.isoformat()):
         logger.info("Morning routine already ran today (%s), skipping.", today)
         return
     db.log_morning_run(conn, today.isoformat())
+    logger.info("Morning routine starting for %s", today)
 
-    tomorrow = today + timedelta(days=1)
-
-    conn = application.bot_data["db"]
-    caldav = application.bot_data["caldav"]
-
-    # Lightweight wrapper to reuse _ask_pending_for_date helper signature.
     class _Ctx:
         bot = application.bot
         bot_data = application.bot_data
         application = application
 
-    await _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False)
-    await _ask_pending_for_date(_Ctx(), chat_id, tomorrow.isoformat(), day_before=True)
-
-    # Check if both parents have overlapping events today → ask childcare
-    await _check_parents_overlap(application, chat_id, today)
-
-    # Logistics question — skip on Saturday (no school)
-    if today.weekday() != 5:  # 5 = Saturday
-        await application.bot.send_message(
-            chat_id,
-            "מי על הפיזורים והאיסופים של נועם ועמית היום?",
-            reply_markup=kb_morning(),
+    # Step 1: pending assignments — isolated, never blocks the rest
+    try:
+        await asyncio.wait_for(
+            _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False),
+            timeout=15.0,
         )
+        await asyncio.wait_for(
+            _ask_pending_for_date(_Ctx(), chat_id, tomorrow.isoformat(), day_before=True),
+            timeout=15.0,
+        )
+    except Exception:
+        logger.exception("Step 1 (pending assignments) failed")
 
-    # Send today's calendar summary
-    class _Ctx2:
-        bot = application.bot
-        bot_data = application.bot_data
-        application = application
-    await _send_daily_summary(_Ctx2(), chat_id)
+    # Step 2: childcare overlap check — isolated
+    try:
+        await asyncio.wait_for(_check_parents_overlap(application, chat_id, today), timeout=25.0)
+    except Exception:
+        logger.exception("Step 2 (parent overlap check) failed")
+
+    # Step 3: logistics question — skip on Saturday (no school)
+    if today.weekday() != 5:
+        try:
+            await application.bot.send_message(
+                chat_id,
+                "מי על הפיזורים והאיסופים של נועם ועמית היום?",
+                reply_markup=kb_morning(),
+            )
+        except Exception:
+            logger.exception("Step 3 (logistics question) failed")
+
+    # Step 4: calendar summary — always send at minimum a greeting
+    try:
+        await asyncio.wait_for(_send_daily_summary(_Ctx(), chat_id), timeout=25.0)
+    except asyncio.TimeoutError:
+        logger.warning("Step 4 (daily summary) timed out — sending fallback greeting")
+        try:
+            await application.bot.send_message(chat_id, "בוקר טוב! 🌅")
+        except Exception:
+            logger.exception("Fallback greeting also failed")
+    except Exception:
+        logger.exception("Step 4 (daily summary) failed — sending fallback greeting")
+        try:
+            await application.bot.send_message(chat_id, "בוקר טוב! 🌅")
+        except Exception:
+            logger.exception("Fallback greeting also failed")
+
+    logger.info("Morning routine completed for %s", today)
 
 
 # ===================================================================
