@@ -823,7 +823,13 @@ async def post_init(application: Application) -> None:
     application.bot_data["db"] = conn
 
     caldav = CalDAVClient()
-    await caldav.connect()
+    try:
+        await asyncio.wait_for(caldav.connect(), timeout=30.0)
+        logger.info("CalDAV connected at startup.")
+    except asyncio.TimeoutError:
+        logger.warning("CalDAV connect timed out at startup — will reconnect on first use.")
+    except Exception:
+        logger.exception("CalDAV connect failed at startup — will reconnect on first use.")
     application.bot_data["caldav"] = caldav
 
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
