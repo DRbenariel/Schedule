@@ -65,8 +65,5 @@ MORNING_MINUTE = int(_optional("MORNING_MINUTE", "0"))
 PORT = int(_optional("PORT", "8080"))
 LOG_LEVEL = _optional("LOG_LEVEL", "INFO")
 
-# Cron trigger secret (used by GitHub Actions to authenticate /cron_morning)
-CRON_SECRET = _optional("CRON_SECRET", "")
-
 # Conversation state timeout (minutes)
 STATE_TIMEOUT_MINUTES = 10
