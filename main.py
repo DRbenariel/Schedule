@@ -301,6 +301,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_cron_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called by GitHub Actions cron every morning. Validates secret then runs routine."""
+    args = context.args or []
+    secret = args[0] if args else ""
+    if config.CRON_SECRET and secret != config.CRON_SECRET:
+        logger.warning("Unauthorized /cron_morning attempt (bad secret)")
+        return
+    # Delete the trigger message to keep the chat clean
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await morning_routine(context.application)
+
+
 async def cmd_testmorning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin: manually trigger the morning routine right now, with step-by-step logging."""
     chat_id = update.effective_chat.id
@@ -863,6 +878,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("testmorning", cmd_testmorning))
+    app.add_handler(CommandHandler("cron_morning", cmd_cron_morning))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

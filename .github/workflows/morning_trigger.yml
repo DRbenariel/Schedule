@@ -1,0 +1,16 @@
+name: Morning Routine Trigger
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 04:00 UTC = 07:00 Israel time (IDT, UTC+3)
+  workflow_dispatch:        # allow manual trigger from GitHub Actions UI
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send morning trigger to bot
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"-5156592857\", \"text\": \"/cron_morning ${{ secrets.CRON_SECRET }}\"}"
