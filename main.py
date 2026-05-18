@@ -9,7 +9,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
-from aiohttp import web as aiohttp_web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -455,6 +454,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sender_name = _resolve_parent(user.id) if user else None
     if sender_name is None:
         await update.message.reply_text("⚠️ המשתמש שלכם לא ממופה להורה. בדקו TAL_TELEGRAM_ID / BEN_TELEGRAM_ID.")
+        return
+
+    # "בוקר טוב" → trigger morning routine
+    if text.strip() in ("בוקר טוב", "בוקר טוב!"):
+        asyncio.create_task(morning_routine(context.application))
         return
 
     await update.effective_chat.send_action("typing")
@@ -1040,60 +1044,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Update %s caused error %s", update, context.error, exc_info=context.error)
 
 
-async def _run_with_custom_server(application: Application) -> None:
-    """Run PTB + aiohttp so we can add a /cron endpoint alongside /webhook."""
-
-    async with application:
-        await application.start()
-
-        # Register webhook only after the bot is fully initialized
-        await application.bot.set_webhook(
-            url=config.TELEGRAM_WEBHOOK_URL,
-            secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
-            allowed_updates=list(Update.ALL_TYPES),
-        )
-        logger.info("Webhook registered: %s", config.TELEGRAM_WEBHOOK_URL)
-
-        async def handle_telegram(request: aiohttp_web.Request) -> aiohttp_web.Response:
-            if config.TELEGRAM_WEBHOOK_SECRET:
-                secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-                if secret != config.TELEGRAM_WEBHOOK_SECRET:
-                    return aiohttp_web.Response(status=403)
-            data = await request.json()
-            update = Update.de_json(data, application.bot)
-            await application.process_update(update)
-            return aiohttp_web.Response()
-
-        async def handle_cron(request: aiohttp_web.Request) -> aiohttp_web.Response:
-            secret = request.headers.get("X-Cron-Secret", "")
-            if config.CRON_SECRET and secret != config.CRON_SECRET:
-                return aiohttp_web.Response(status=401, text="Unauthorized")
-            logger.info("Cron endpoint triggered — running morning routine")
-            asyncio.create_task(morning_routine(application))
-            return aiohttp_web.Response(text="ok")
-
-        async def handle_health(request: aiohttp_web.Request) -> aiohttp_web.Response:
-            return aiohttp_web.Response(text="ok")
-
-        web_app = aiohttp_web.Application()
-        web_app.router.add_post("/webhook", handle_telegram)
-        web_app.router.add_post("/cron", handle_cron)
-        web_app.router.add_get("/health", handle_health)
-        web_app.router.add_get("/", handle_health)
-
-        runner = aiohttp_web.AppRunner(web_app)
-        await runner.setup()
-        site = aiohttp_web.TCPSite(runner, "0.0.0.0", config.PORT)
-        await site.start()
-        logger.info("aiohttp server started on port %d", config.PORT)
-
-        try:
-            await asyncio.Event().wait()  # block forever
-        finally:
-            await runner.cleanup()
-            await application.stop()
-
-
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_error_handler(error_handler)
@@ -1128,8 +1078,14 @@ def main() -> None:
         try:
             app = build_application()
             if config.TELEGRAM_WEBHOOK_URL:
-                logger.info("Starting in webhook mode (aiohttp) on port %d", config.PORT)
-                asyncio.run(_run_with_custom_server(app))
+                logger.info("Starting in webhook mode on port %d", config.PORT)
+                app.run_webhook(
+                    listen="0.0.0.0",
+                    port=config.PORT,
+                    url_path="webhook",
+                    webhook_url=config.TELEGRAM_WEBHOOK_URL,
+                    secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+                )
             else:
                 logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
                 app.run_polling(allowed_updates=Update.ALL_TYPES)

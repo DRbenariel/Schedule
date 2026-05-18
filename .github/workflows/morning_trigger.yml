@@ -1,17 +1,4 @@
 name: Morning Routine
 
 on:
-  schedule:
-    - cron: '55 7 * * *'   # 07:55 UTC = 10:55 Israel time (IDT) — TEMP TEST
-  workflow_dispatch:
-
-jobs:
-  trigger:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger morning routine on Cloud Run
-        run: |
-          curl -s -f -X POST \
-            "https://family-calendar-bot-217503293554.me-west1.run.app/cron" \
-            -H "X-Cron-Secret: morning-cron-2026-fc" \
-            --max-time 30
+  workflow_dispatch:   # manual trigger only — routine is triggered by "בוקר טוב" in chat
