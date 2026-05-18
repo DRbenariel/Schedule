@@ -2,30 +2,16 @@ name: Morning Routine
 
 on:
   schedule:
-    - cron: '55 7 * * *'   # 07:55 UTC = 10:55 Israel time (IDT, UTC+3) — TEMP TEST
-  workflow_dispatch:        # allow manual trigger from GitHub Actions UI
+    - cron: '55 7 * * *'   # 07:55 UTC = 10:55 Israel time (IDT) — TEMP TEST
+  workflow_dispatch:
 
 jobs:
-  morning:
+  trigger:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: pip install caldav icalendar "python-telegram-bot>=20.0" pytz
-
-      - name: Run morning job
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_GROUP_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_CHAT_ID }}
-          ICLOUD_USER: ${{ secrets.ICLOUD_USER }}
-          ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
-          ICLOUD_CALENDAR_NAME: ${{ secrets.ICLOUD_CALENDAR_NAME }}
-        run: python morning_job.py
+      - name: Trigger morning routine on Cloud Run
+        run: |
+          curl -s -f -X POST \
+            "https://family-calendar-bot-217503293554.me-west1.run.app/cron" \
+            -H "X-Cron-Secret: morning-cron-2026-fc" \
+            --max-time 30

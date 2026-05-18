@@ -9,6 +9,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
+from aiohttp import web as aiohttp_web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -856,6 +857,116 @@ async def _send_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     await context.bot.send_message(chat_id, summary)
 
 
+async def _check_child_coverage_and_notify(
+    application: Application, chat_id: int, today: "date"
+) -> None:
+    """Fetch today's events and send child-coverage alerts (unified logic)."""
+    _BEN_EMAILS = {"benariel@gmail.com", "benariel@icloud.com"}
+    _TAL_EMAILS = {"tal8202@gmail.com", "tal8202@icloud.com"}
+    _CHILDREN   = {"נועם", "עמית"}
+    conn   = application.bot_data["db"]
+    caldav = application.bot_data["caldav"]
+
+    day_start = _to_aware(today)
+    day_end   = day_start + timedelta(days=1)
+    try:
+        raw_events = await asyncio.wait_for(
+            caldav.get_events_for_range(day_start, day_end), timeout=20.0
+        )
+    except Exception:
+        logger.exception("Failed to fetch events for child-coverage check — skipping")
+        return
+
+    # Convert CalEvent objects to the dict shape used by the coverage logic
+    events = [
+        {
+            "title":           ev.title,
+            "organizer_email": ev.organizer_email,
+            "is_all_day":      ev.is_all_day,
+            "start":           ev.start,
+            "end":             ev.end,
+        }
+        for ev in raw_events
+    ]
+
+    def _classify(ev: dict):
+        title = ev["title"]
+        org   = ev["organizer_email"]
+        is_ben = ("- בן" in title) or ("+ בן" in title) or (org in _BEN_EMAILS)
+        is_tal = ("- טל" in title) or ("+ טל" in title) or (org in _TAL_EMAILS)
+        covered = {n for n in _CHILDREN if n in title}
+        return is_ben, is_tal, covered
+
+    def _aw(dt):
+        return _to_aware(dt) if dt else None
+
+    ben_slots, tal_slots, neutral_child = [], [], []
+    for ev in events:
+        if ev["is_all_day"] or not ev["start"]:
+            continue
+        s = _aw(ev["start"])
+        e = _aw(ev["end"]) if ev["end"] else s + timedelta(hours=1)
+        is_ben, is_tal, covered = _classify(ev)
+        if is_ben:
+            ben_slots.append((s, e, covered, ev["title"]))
+        if is_tal:
+            tal_slots.append((s, e, covered, ev["title"]))
+        if any(n in ev["title"] for n in _CHILDREN) and not is_ben and not is_tal:
+            neutral_child.append((s, e, ev["title"]))
+
+    alerts, seen = [], set()
+    for bs, be, b_cov, b_title in ben_slots:
+        for ts, te, t_cov, t_title in tal_slots:
+            ov_s = max(bs, ts)
+            ov_e = min(be, te)
+            if ov_s >= ov_e:
+                continue
+            uncovered = _CHILDREN - (b_cov | t_cov)
+            key = (ov_s, frozenset(uncovered))
+            if not uncovered or key in seen:
+                continue
+            seen.add(key)
+            child_str = " ו".join(sorted(uncovered))
+            time_str  = f"{ov_s.strftime('%H:%M')}–{ov_e.strftime('%H:%M')}"
+            if not b_cov and not t_cov:
+                alerts.append(f"🧒 {time_str}: שני ההורים עסוקים — מי שומר על {child_str}?")
+            else:
+                alerts.append(
+                    f"🧒 {time_str}: {child_str} ללא השגחה\n"
+                    f"   בן: {b_title} | טל: {t_title}"
+                )
+    for cs, ce, ctitle in neutral_child:
+        ben_busy = [t for bs, be, _, t in ben_slots if bs < ce and be > cs]
+        tal_busy = [t for ts, te, _, t in tal_slots if ts < ce and te > cs]
+        if ben_busy and tal_busy:
+            alerts.append(f"⚠️ {ctitle}: שני ההורים עסוקים — בן: {', '.join(ben_busy)} | טל: {', '.join(tal_busy)}")
+        elif ben_busy:
+            alerts.append(f"⚠️ {ctitle}: בן עסוק ({', '.join(ben_busy)}) — טל מטפל/ת")
+        elif tal_busy:
+            alerts.append(f"⚠️ {ctitle}: טל עסוק/ה ({', '.join(tal_busy)}) — בן מטפל")
+
+    if not alerts:
+        return
+
+    # Avoid duplicate childcare questions on the same day
+    existing = db.get_pending_for_date(conn, today.isoformat(), day_before=False)
+    already_asked = any("שמירה:" in r["title"] for r in existing)
+
+    msg = "\n\n".join(alerts)
+    if not already_asked:
+        # Add a pending row so the answer is tracked
+        row_id = db.add_pending_assignment(
+            conn,
+            f"childcare-{today.isoformat()}",
+            "שמירה: ילדים ללא השגחה",
+            today.isoformat(),
+            chat_id,
+        )
+        await application.bot.send_message(chat_id, msg, reply_markup=kb_childcare(row_id))
+    else:
+        await application.bot.send_message(chat_id, msg)
+
+
 async def morning_routine(application: Application) -> None:
     chat_id = config.TELEGRAM_GROUP_CHAT_ID
     if not chat_id:
@@ -878,8 +989,8 @@ async def morning_routine(application: Application) -> None:
     await _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False)
     await _ask_pending_for_date(_Ctx(), chat_id, tomorrow.isoformat(), day_before=True)
 
-    # Check if both parents have overlapping events today → ask childcare
-    await _check_parents_overlap(application, chat_id, today)
+    # Unified child-coverage check (replaces simple overlap check)
+    await _check_child_coverage_and_notify(application, chat_id, today)
 
     # Logistics question — skip on Saturday (no school)
     if today.weekday() != 5:  # 5 = Saturday
@@ -929,6 +1040,59 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Update %s caused error %s", update, context.error, exc_info=context.error)
 
 
+async def _run_with_custom_server(application: Application) -> None:
+    """Run PTB + aiohttp so we can add a /cron endpoint alongside /webhook."""
+
+    # Register webhook with Telegram
+    await application.bot.set_webhook(
+        url=config.TELEGRAM_WEBHOOK_URL,
+        secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+        allowed_updates=list(Update.ALL_TYPES),
+    )
+
+    async with application:
+        await application.start()
+
+        async def handle_telegram(request: aiohttp_web.Request) -> aiohttp_web.Response:
+            if config.TELEGRAM_WEBHOOK_SECRET:
+                secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+                if secret != config.TELEGRAM_WEBHOOK_SECRET:
+                    return aiohttp_web.Response(status=403)
+            data = await request.json()
+            update = Update.de_json(data, application.bot)
+            await application.process_update(update)
+            return aiohttp_web.Response()
+
+        async def handle_cron(request: aiohttp_web.Request) -> aiohttp_web.Response:
+            secret = request.headers.get("X-Cron-Secret", "")
+            if config.CRON_SECRET and secret != config.CRON_SECRET:
+                return aiohttp_web.Response(status=401, text="Unauthorized")
+            logger.info("Cron endpoint triggered — running morning routine")
+            asyncio.create_task(morning_routine(application))
+            return aiohttp_web.Response(text="ok")
+
+        async def handle_health(request: aiohttp_web.Request) -> aiohttp_web.Response:
+            return aiohttp_web.Response(text="ok")
+
+        web_app = aiohttp_web.Application()
+        web_app.router.add_post("/webhook", handle_telegram)
+        web_app.router.add_post("/cron", handle_cron)
+        web_app.router.add_get("/health", handle_health)
+        web_app.router.add_get("/", handle_health)
+
+        runner = aiohttp_web.AppRunner(web_app)
+        await runner.setup()
+        site = aiohttp_web.TCPSite(runner, "0.0.0.0", config.PORT)
+        await site.start()
+        logger.info("aiohttp server started on port %d", config.PORT)
+
+        try:
+            await asyncio.Event().wait()  # block forever
+        finally:
+            await runner.cleanup()
+            await application.stop()
+
+
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_error_handler(error_handler)
@@ -963,14 +1127,8 @@ def main() -> None:
         try:
             app = build_application()
             if config.TELEGRAM_WEBHOOK_URL:
-                logger.info("Starting in webhook mode on port %d", config.PORT)
-                app.run_webhook(
-                    listen="0.0.0.0",
-                    port=config.PORT,
-                    url_path="webhook",
-                    webhook_url=config.TELEGRAM_WEBHOOK_URL,
-                    secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
-                )
+                logger.info("Starting in webhook mode (aiohttp) on port %d", config.PORT)
+                asyncio.run(_run_with_custom_server(app))
             else:
                 logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
                 app.run_polling(allowed_updates=Update.ALL_TYPES)
