@@ -174,6 +174,57 @@ def _payload_with_pending(parsed: ParsedEvent, pending: bool) -> dict:
     return payload
 
 
+def _build_title_with_assignment(
+    base_title: str,
+    involves_children: list[str],
+    assignment: str,
+) -> str:
+    """Return the canonical CalDAV title: 'event - child + parent' or 'event - parent'.
+
+    assignment should be one of ASSIGN_TAL, ASSIGN_BEN, ASSIGN_BOTH, ASSIGN_LATER,
+    or an extended-family name.
+    """
+    # Don't double-suffix if already assigned
+    for marker in ("- טל", "- בן", "+ טל", "+ בן", "+ להחליט"):
+        if marker in base_title:
+            return base_title
+
+    child_str = " ו".join(involves_children) if involves_children else ""
+
+    if assignment == ASSIGN_BOTH:
+        suffix = "בן וטל"
+    elif assignment == ASSIGN_LATER:
+        suffix = "להחליט" if child_str else None
+    else:
+        suffix = assignment  # "טל", "בן", or extended-family name
+
+    if not suffix:
+        return base_title
+    if child_str:
+        return f"{base_title} - {child_str} + {suffix}"
+    return f"{base_title} - {suffix}"
+
+
+def _filter_conflicts_for_parent(
+    conflicts: list, assigned_parent: str | None
+) -> list:
+    """Remove conflicts that belong exclusively to the *other* parent.
+
+    This prevents Ben's event from being blocked by Tal's simultaneous event.
+    Events with no parent suffix (shared/family events) are always kept.
+    """
+    if not assigned_parent:
+        return conflicts
+    other = ASSIGN_BEN if assigned_parent == ASSIGN_TAL else ASSIGN_TAL
+
+    def _is_other_only(title: str) -> bool:
+        has_other = (f"- {other}" in title or f"+ {other}" in title)
+        has_mine  = (f"- {assigned_parent}" in title or f"+ {assigned_parent}" in title)
+        return has_other and not has_mine
+
+    return [c for c in conflicts if not _is_other_only(c.title)]
+
+
 async def _proceed_after_parsing(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -206,6 +257,15 @@ async def _proceed_after_parsing(
     except Exception:
         logger.exception("Conflict check failed")
         conflicts = []
+
+    # Filter out conflicts that belong to the *other* parent only.
+    # (e.g. Ben taking a child to swim should not be blocked by Tal's night shift)
+    assigned_parent = None
+    for p in (ASSIGN_TAL, ASSIGN_BEN):
+        if f"- {p}" in parsed.title or f"+ {p}" in parsed.title:
+            assigned_parent = p
+            break
+    conflicts = _filter_conflicts_for_parent(conflicts, assigned_parent)
 
     if conflicts:
         names = ", ".join(c.title for c in conflicts[:3])
@@ -441,8 +501,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(prompt, reply_markup=kb_assign_select(bool(parsed.involves_children)))
             return
         both_parents = set(parsed.mentioned_parents) >= {ASSIGN_TAL, ASSIGN_BEN}
-        if both_parents and "- בן וטל" not in parsed.title:
-            parsed.title = f"{parsed.title} - בן וטל"
+        assignment = ASSIGN_BOTH if both_parents else (list(parsed.mentioned_parents)[0] if parsed.mentioned_parents else None)
+        if assignment:
+            parsed.title = _build_title_with_assignment(parsed.title, parsed.involves_children, assignment)
         await _proceed_after_parsing(update, context, parsed, childcare_needed=both_parents)
         return
 
@@ -481,8 +542,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     both_parents = set(parsed.mentioned_parents) >= {ASSIGN_TAL, ASSIGN_BEN}
-    if both_parents and "- בן וטל" not in parsed.title:
-        parsed.title = f"{parsed.title} - בן וטל"
+    assignment = ASSIGN_BOTH if both_parents else (list(parsed.mentioned_parents)[0] if parsed.mentioned_parents else None)
+    if assignment:
+        parsed.title = _build_title_with_assignment(parsed.title, parsed.involves_children, assignment)
     await _proceed_after_parsing(update, context, parsed, childcare_needed=both_parents)
 
 
@@ -572,28 +634,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pending = False
 
         if choice == ASSIGN_TAL or choice == ASSIGN_BEN:
-            parsed.title = f"{parsed.title} - {choice}"
+            parsed.title = _build_title_with_assignment(parsed.title, parsed.involves_children, choice)
             await query.edit_message_text(f"שויך ל-{choice}.")
 
         elif choice == ASSIGN_BOTH:
-            parsed.title = f"{parsed.title} - בן וטל"
+            parsed.title = _build_title_with_assignment(parsed.title, parsed.involves_children, ASSIGN_BOTH)
             await query.edit_message_text("שניהם. ממשיך לאישור.")
             await _proceed_after_parsing(update, context, parsed, pending=False, childcare_needed=True)
             return
 
         elif choice == ASSIGN_LATER:
             pending = True
+            parsed.title = _build_title_with_assignment(parsed.title, parsed.involves_children, ASSIGN_LATER)
             await query.edit_message_text("נשמור ונשאל בבוקר.")
 
         elif choice == ASSIGN_OTHER:
-            # Fix 3: show extended family keyboard
             await query.edit_message_reply_markup(reply_markup=kb_ext_assign())
             return
 
         elif choice.startswith("ext:"):
-            # Fix 3: extended family member selected
             caregiver = choice[4:]
-            parsed.title = f"{parsed.title} - {caregiver}"
+            parsed.title = _build_title_with_assignment(parsed.title, parsed.involves_children, caregiver)
             await query.edit_message_text(f"שויך ל-{caregiver}.")
 
         else:
@@ -651,7 +712,13 @@ async def _handle_pending_callback(update, context, query, data: str) -> None:
         return
 
     if choice in (ASSIGN_TAL, ASSIGN_BEN):
-        new_title = f"{row['title']} - {choice}"
+        base = row['title']
+        # If the pending placeholder was written (child event: "X - נועם + להחליט"),
+        # replace the placeholder rather than appending again.
+        if '+ להחליט' in base:
+            new_title = base.replace('+ להחליט', f'+ {choice}')
+        else:
+            new_title = f"{base} - {choice}"
         ok = await caldav.update_event_title(row["event_uid"], new_title)
         if not ok:
             await query.edit_message_text("❌ לא הצלחתי לעדכן את היומן.")
@@ -661,8 +728,12 @@ async def _handle_pending_callback(update, context, query, data: str) -> None:
         return
 
     if choice == ASSIGN_BOTH:
+        base = row['title']
+        if '+ להחליט' in base:
+            new_title = base.replace('+ להחליט', '+ בן וטל')
+            await caldav.update_event_title(row["event_uid"], new_title)
         db.resolve_pending(conn, row_id, ASSIGN_BOTH)
-        await query.edit_message_text(f"✅ '{row['title']}' נותר משותף (ללא שיוך).")
+        await query.edit_message_text(f"✅ '{row['title']}' נותר משותף.")
         return
 
 
