@@ -2,7 +2,7 @@ name: Morning Routine
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # 04:00 UTC = 07:00 Israel time (IDT, UTC+3)
+    - cron: '55 7 * * *'   # 07:55 UTC = 10:55 Israel time (IDT, UTC+3) — TEMP TEST
   workflow_dispatch:        # allow manual trigger from GitHub Actions UI
 
 jobs:

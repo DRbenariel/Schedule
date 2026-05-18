@@ -125,55 +125,82 @@ def _get_today_events(calendar: caldav.Calendar, today: date_type) -> list[dict]
 
 
 # ── Logic ─────────────────────────────────────────────────────────────────────
-def _check_overlap(events: list[dict]) -> bool:
-    ben_slots, tal_slots = [], []
+def _classify_event(ev: dict) -> tuple[bool, bool, set[str]]:
+    """Return (is_ben, is_tal, children_covered_by_this_event)."""
+    title = ev["title"]
+    org   = ev["organizer_email"]
+    is_ben = ("- בן" in title) or ("+ בן" in title) or (org in BEN_EMAILS)
+    is_tal = ("- טל" in title) or ("+ טל" in title) or (org in TAL_EMAILS)
+    covered = {name for name in CHILDREN_NAMES if name in title}
+    return is_ben, is_tal, covered
+
+
+def _check_child_coverage(events: list[dict]) -> list[str]:
+    """Unified check: find any time window where a child has no available parent.
+
+    Handles all cases:
+      • Both parents solo busy         → all children need coverage
+      • Parent A with Child X, Parent B solo
+                                       → Child Y (the other child) needs coverage
+      • Neutral child event (not yet attributed to a parent) overlapping a
+        parent's busy slot             → that parent can't take the child
+    """
+    # ── attributed parent slots ────────────────────────────────────────────────
+    ben_slots: list[tuple] = []   # (start, end, covered_children, title)
+    tal_slots: list[tuple] = []
+    neutral_child_events: list[tuple] = []   # (start, end, title)
+
     for ev in events:
         if ev["is_all_day"] or not ev["start"]:
             continue
         s = _ensure_aware(ev["start"])
         e = _ensure_aware(ev["end"]) if ev["end"] else s + timedelta(hours=1)
-        title = ev["title"]
-        org   = ev["organizer_email"]
-        # Match by bot-assigned title suffix OR by organizer email
-        is_ben = ("- בן" in title) or (org in BEN_EMAILS)
-        is_tal = ("- טל" in title) or (org in TAL_EMAILS)
+        is_ben, is_tal, covered = _classify_event(ev)
         if is_ben:
-            ben_slots.append((s, e))
+            ben_slots.append((s, e, covered, ev["title"]))
         if is_tal:
-            tal_slots.append((s, e))
+            tal_slots.append((s, e, covered, ev["title"]))
+        # Neutral = involves a child but not attributed to either parent yet
+        if any(name in ev["title"] for name in CHILDREN_NAMES) and not is_ben and not is_tal:
+            neutral_child_events.append((s, e, ev["title"]))
 
-    return any(
-        bs < te and be > ts
-        for bs, be in ben_slots
-        for ts, te in tal_slots
-    )
+    alerts: list[str] = []
+    seen: set = set()
 
+    # ── Case 1 & 2: overlapping parent slots ──────────────────────────────────
+    for bs, be, b_cov, b_title in ben_slots:
+        for ts, te, t_cov, t_title in tal_slots:
+            overlap_s = max(bs, ts)
+            overlap_e = min(be, te)
+            if overlap_s >= overlap_e:
+                continue
 
-def _check_child_conflicts(events: list[dict]) -> list[str]:
-    """Return alert strings for child activities where a parent is simultaneously busy."""
-    ben_slots, tal_slots, child_events = [], [], []
-    for ev in events:
-        if ev["is_all_day"] or not ev["start"]:
-            continue
-        s     = _ensure_aware(ev["start"])
-        e     = _ensure_aware(ev["end"]) if ev["end"] else s + timedelta(hours=1)
-        title = ev["title"]
-        org   = ev["organizer_email"]
-        is_ben = ("- בן" in title) or (org in BEN_EMAILS)
-        is_tal = ("- טל" in title) or (org in TAL_EMAILS)
-        is_child = any(name in title for name in CHILDREN_NAMES)
-        if is_ben:
-            ben_slots.append((s, e, title))
-        if is_tal:
-            tal_slots.append((s, e, title))
-        # Neutral events (not attributed to a parent) that involve children
-        if is_child and not is_ben and not is_tal:
-            child_events.append((s, e, title))
+            all_covered   = b_cov | t_cov
+            uncovered     = CHILDREN_NAMES - all_covered
+            key = (overlap_s, frozenset(uncovered))
+            if not uncovered or key in seen:
+                continue
+            seen.add(key)
 
-    alerts = []
-    for cs, ce, ctitle in child_events:
-        ben_busy = [t for bs, be, t in ben_slots if bs < ce and be > cs]
-        tal_busy = [t for ts, te, t in tal_slots if ts < ce and te > cs]
+            child_str = " ו".join(sorted(uncovered))
+            time_str  = f"{overlap_s.strftime('%H:%M')}–{overlap_e.strftime('%H:%M')}"
+
+            if not b_cov and not t_cov:
+                # Both parents fully solo — classic overlap
+                alerts.append(
+                    f"🧒 {time_str}: שני ההורים עסוקים — מי שומר על {child_str}?"
+                )
+            else:
+                # One parent is with a child, other is solo → sibling unattended
+                alerts.append(
+                    f"🧒 {time_str}: {child_str} ללא השגחה\n"
+                    f"   בן: {b_title} | טל: {t_title}"
+                )
+
+    # ── Case 3: neutral child event overlaps a parent's busy slot ─────────────
+    for cs, ce, ctitle in neutral_child_events:
+        ben_busy = [t for bs, be, _, t in ben_slots if bs < ce and be > cs]
+        tal_busy = [t for ts, te, _, t in tal_slots if ts < ce and te > cs]
         if ben_busy and tal_busy:
             alerts.append(
                 f"⚠️ {ctitle}: שני ההורים עסוקים — "
@@ -183,6 +210,7 @@ def _check_child_conflicts(events: list[dict]) -> list[str]:
             alerts.append(f"⚠️ {ctitle}: בן עסוק ({', '.join(ben_busy)}) — טל מטפל/ת")
         elif tal_busy:
             alerts.append(f"⚠️ {ctitle}: טל עסוק/ה ({', '.join(tal_busy)}) — בן מטפל")
+
     return alerts
 
 
@@ -228,27 +256,17 @@ async def main() -> None:
         print(f"CalDAV error: {exc}", file=sys.stderr)
 
     async with bot:
-        # 2. Parent overlap → childcare question
+        # 2. Unified child-coverage check
         try:
-            if events and _check_overlap(events):
-                print("Overlap detected — sending childcare question")
+            coverage_alerts = _check_child_coverage(events) if events else []
+            if coverage_alerts:
+                print(f"Coverage alerts: {len(coverage_alerts)}")
                 await bot.send_message(
                     TELEGRAM_GROUP_CHAT_ID,
-                    "🧒 שני ההורים עסוקים בו-זמנית היום — מי שומר על נועם ועמית?",
+                    "\n\n".join(coverage_alerts),
                 )
         except Exception as exc:
-            print(f"Overlap check error: {exc}", file=sys.stderr)
-
-        # 2b. Child-activity conflicts
-        try:
-            child_alerts = _check_child_conflicts(events) if events else []
-            if child_alerts:
-                await bot.send_message(
-                    TELEGRAM_GROUP_CHAT_ID,
-                    "🧒 התנגשויות בפעילויות ילדים:\n" + "\n".join(child_alerts),
-                )
-        except Exception as exc:
-            print(f"Child conflict check error: {exc}", file=sys.stderr)
+            print(f"Child coverage check error: {exc}", file=sys.stderr)
 
         # 3. Logistics question — skip on Saturday (weekday 5)
         if today.weekday() != 5:
