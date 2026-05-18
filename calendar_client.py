@@ -28,6 +28,7 @@ class CalEvent:
     start: datetime | date | None
     end: datetime | date | None
     is_all_day: bool
+    organizer_email: str = ""
 
 
 class CalDAVClient:
@@ -92,6 +93,11 @@ class CalDAVClient:
                 start_val = dtstart.dt if dtstart else None
                 end_val = dtend.dt if dtend else None
                 is_all_day = isinstance(start_val, date) and not isinstance(start_val, datetime)
+                organizer = component.get("organizer")
+                organizer_email = (
+                    str(organizer).replace("mailto:", "").lower().strip()
+                    if organizer else ""
+                )
                 events.append(
                     CalEvent(
                         uid=str(component.get("uid", "")),
@@ -99,6 +105,7 @@ class CalDAVClient:
                         start=start_val,
                         end=end_val,
                         is_all_day=is_all_day,
+                        organizer_email=organizer_email,
                     )
                 )
         return events

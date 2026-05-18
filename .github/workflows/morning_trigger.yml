@@ -1,4 +1,4 @@
-name: Morning Routine Trigger
+name: Morning Routine
 
 on:
   schedule:
@@ -6,11 +6,37 @@ on:
   workflow_dispatch:        # allow manual trigger from GitHub Actions UI
 
 jobs:
-  trigger:
+  morning:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: Send morning trigger to bot
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install caldav icalendar "python-telegram-bot>=20.0" pytz
+
+      - name: Fetch secrets and run morning job
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"-5156592857\", \"text\": \"/cron_morning ${{ secrets.CRON_SECRET }}\"}"
+          PROJECT=gen-lang-client-0972507273
+          export TELEGRAM_TOKEN=$(gcloud secrets versions access latest --secret=TELEGRAM_TOKEN --project=$PROJECT)
+          export TELEGRAM_GROUP_CHAT_ID=$(gcloud secrets versions access latest --secret=TELEGRAM_GROUP_CHAT_ID --project=$PROJECT)
+          export ICLOUD_USER=$(gcloud secrets versions access latest --secret=ICLOUD_USER --project=$PROJECT)
+          export ICLOUD_APP_PASSWORD=$(gcloud secrets versions access latest --secret=ICLOUD_APP_PASSWORD --project=$PROJECT)
+          export ICLOUD_CALENDAR_NAME=$(gcloud secrets versions access latest --secret=ICLOUD_CALENDAR_NAME --project=$PROJECT)
+          python morning_job.py

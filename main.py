@@ -692,6 +692,10 @@ async def _check_parents_overlap(
         logger.exception("Failed to fetch events for overlap check")
         return
 
+    # Parent email sets for organizer-based detection
+    _BEN_EMAILS = {"benariel@gmail.com", "benariel@icloud.com"}
+    _TAL_EMAILS = {"tal8202@gmail.com", "tal8202@icloud.com"}
+
     # Skip all-day events; collect timed events per parent
     ben_slots, tal_slots = [], []
     for ev in events:
@@ -699,9 +703,13 @@ async def _check_parents_overlap(
             continue
         s = _to_aware(ev.start)
         e = _to_aware(ev.end) if ev.end else s + timedelta(hours=1)
-        if "- בן" in ev.title or "- בן וטל" in ev.title:
+        is_ben = ("- בן" in ev.title or "- בן וטל" in ev.title
+                  or ev.organizer_email in _BEN_EMAILS)
+        is_tal = ("- טל" in ev.title or "- בן וטל" in ev.title
+                  or ev.organizer_email in _TAL_EMAILS)
+        if is_ben:
             ben_slots.append((s, e))
-        if "- טל" in ev.title or "- בן וטל" in ev.title:
+        if is_tal:
             tal_slots.append((s, e))
 
     # Check for any overlap between בן and טל
