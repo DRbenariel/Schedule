@@ -989,21 +989,23 @@ async def morning_routine(application: Application) -> None:
     conn = application.bot_data["db"]
     caldav = application.bot_data["caldav"]
 
-    # Lightweight wrapper to reuse _ask_pending_for_date helper signature.
+    # Lightweight context wrapper — use _app to avoid name collision in class body
+    _app = application
+
     class _Ctx:
-        bot = application.bot
-        bot_data = application.bot_data
-        application = application
+        bot = _app.bot
+        bot_data = _app.bot_data
+        application = _app
 
     await _ask_pending_for_date(_Ctx(), chat_id, today.isoformat(), day_before=False)
     await _ask_pending_for_date(_Ctx(), chat_id, tomorrow.isoformat(), day_before=True)
 
-    # Unified child-coverage check (replaces simple overlap check)
-    await _check_child_coverage_and_notify(application, chat_id, today)
+    # Unified child-coverage check
+    await _check_child_coverage_and_notify(_app, chat_id, today)
 
     # Logistics question — skip on Saturday (no school)
-    if today.weekday() != 5:  # 5 = Saturday
-        await application.bot.send_message(
+    if today.weekday() != 5:
+        await _app.bot.send_message(
             chat_id,
             "מי על הפיזורים והאיסופים של נועם ועמית היום?",
             reply_markup=kb_morning(),
@@ -1011,9 +1013,10 @@ async def morning_routine(application: Application) -> None:
 
     # Send today's calendar summary
     class _Ctx2:
-        bot = application.bot
-        bot_data = application.bot_data
-        application = application
+        bot = _app.bot
+        bot_data = _app.bot_data
+        application = _app
+
     await _send_daily_summary(_Ctx2(), chat_id)
 
 
