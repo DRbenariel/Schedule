@@ -34,6 +34,8 @@ TAL_EMAILS = {"tal8202@gmail.com", "tal8202@icloud.com"}
 
 HEB_DAYS = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
 
+CHILDREN_NAMES = {"נועם", "עמית"}
+
 MORNING_OPTIONS = [
     "טל מפזר/ת, בן אוסף/ת",
     "בן מפזר/ת, טל אוסף/ת",
@@ -147,6 +149,43 @@ def _check_overlap(events: list[dict]) -> bool:
     )
 
 
+def _check_child_conflicts(events: list[dict]) -> list[str]:
+    """Return alert strings for child activities where a parent is simultaneously busy."""
+    ben_slots, tal_slots, child_events = [], [], []
+    for ev in events:
+        if ev["is_all_day"] or not ev["start"]:
+            continue
+        s     = _ensure_aware(ev["start"])
+        e     = _ensure_aware(ev["end"]) if ev["end"] else s + timedelta(hours=1)
+        title = ev["title"]
+        org   = ev["organizer_email"]
+        is_ben = ("- בן" in title) or (org in BEN_EMAILS)
+        is_tal = ("- טל" in title) or (org in TAL_EMAILS)
+        is_child = any(name in title for name in CHILDREN_NAMES)
+        if is_ben:
+            ben_slots.append((s, e, title))
+        if is_tal:
+            tal_slots.append((s, e, title))
+        # Neutral events (not attributed to a parent) that involve children
+        if is_child and not is_ben and not is_tal:
+            child_events.append((s, e, title))
+
+    alerts = []
+    for cs, ce, ctitle in child_events:
+        ben_busy = [t for bs, be, t in ben_slots if bs < ce and be > cs]
+        tal_busy = [t for ts, te, t in tal_slots if ts < ce and te > cs]
+        if ben_busy and tal_busy:
+            alerts.append(
+                f"⚠️ {ctitle}: שני ההורים עסוקים — "
+                f"בן: {', '.join(ben_busy)} | טל: {', '.join(tal_busy)}"
+            )
+        elif ben_busy:
+            alerts.append(f"⚠️ {ctitle}: בן עסוק ({', '.join(ben_busy)}) — טל מטפל/ת")
+        elif tal_busy:
+            alerts.append(f"⚠️ {ctitle}: טל עסוק/ה ({', '.join(tal_busy)}) — בן מטפל")
+    return alerts
+
+
 def _format_summary(events: list[dict], today: date_type) -> str:
     weekday = HEB_DAYS[today.weekday()]
     header  = f'בוקר טוב! הנה הלו"ז להיום 📅\n{weekday}, {today.strftime("%d/%m/%Y")}'
@@ -199,6 +238,17 @@ async def main() -> None:
                 )
         except Exception as exc:
             print(f"Overlap check error: {exc}", file=sys.stderr)
+
+        # 2b. Child-activity conflicts
+        try:
+            child_alerts = _check_child_conflicts(events) if events else []
+            if child_alerts:
+                await bot.send_message(
+                    TELEGRAM_GROUP_CHAT_ID,
+                    "🧒 התנגשויות בפעילויות ילדים:\n" + "\n".join(child_alerts),
+                )
+        except Exception as exc:
+            print(f"Child conflict check error: {exc}", file=sys.stderr)
 
         # 3. Logistics question — skip on Saturday (weekday 5)
         if today.weekday() != 5:

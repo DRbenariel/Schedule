@@ -500,13 +500,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         idx = int(data[len(CB_MORNING):])
         if 0 <= idx < len(MORNING_OPTIONS):
             answer = MORNING_OPTIONS[idx]
-            today = datetime.now(config.TIMEZONE).date().isoformat()
-            db.save_morning_answer(conn, today, answer, update.effective_user.id if update.effective_user else 0)
-            try:
-                caldav: CalDAVClient = context.application.bot_data["caldav"]
-                await caldav.write_all_day(f"לוגיסטיקה: {answer}", datetime.now(config.TIMEZONE).date())
-            except Exception:
-                logger.exception("Logistics CalDAV write failed (non-fatal)")
+            today = datetime.now(config.TIMEZONE).date()
+            today_str = today.isoformat()
+            # Check if already answered today — avoid duplicate CalDAV writes
+            existing = db.get_morning_answer(conn, today_str)
+            db.save_morning_answer(conn, today_str, answer, update.effective_user.id if update.effective_user else 0)
+            if not existing:
+                try:
+                    caldav: CalDAVClient = context.application.bot_data["caldav"]
+                    await caldav.write_all_day(f"לוגיסטיקה: {answer}", today)
+                except Exception:
+                    logger.exception("Logistics CalDAV write failed (non-fatal)")
             await query.edit_message_text(f"✅ נרשם: {answer}")
             await _send_daily_summary(context, chat_id)
         return
@@ -840,22 +844,13 @@ async def post_init(application: Application) -> None:
         logger.exception("CalDAV connect failed at startup — will reconnect on first use.")
     application.bot_data["caldav"] = caldav
 
+    # Morning routine is triggered by GitHub Actions cron (morning_job.py).
+    # APScheduler is kept running only to support future in-process jobs if needed,
+    # but the morning_routine job is NOT scheduled here to avoid double-firing.
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
-    scheduler.add_job(
-        morning_routine,
-        CronTrigger(hour=config.MORNING_HOUR, minute=config.MORNING_MINUTE),
-        args=[application],
-        id="morning_routine",
-        replace_existing=True,
-    )
     scheduler.start()
     application.bot_data["scheduler"] = scheduler
-    logger.info(
-        "Bot initialized. Morning routine scheduled at %02d:%02d Asia/Jerusalem. "
-        "Next fire: %s",
-        config.MORNING_HOUR, config.MORNING_MINUTE,
-        scheduler.get_job("morning_routine").next_run_time,
-    )
+    logger.info("Bot initialized. Morning routine handled by GitHub Actions cron.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
