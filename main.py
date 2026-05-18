@@ -338,6 +338,21 @@ async def cmd_testmorning(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text("🔧 שלב 2: בודק חפיפה בין הורים ביומן…")
     try:
+        day_start = _to_aware(today)
+        day_end = day_start + timedelta(days=1)
+        events = await asyncio.wait_for(
+            caldav.get_events_for_range(day_start, day_end), timeout=25.0
+        )
+        timed = [e for e in events if not e.is_all_day and e.start]
+        ben_events = [e.title for e in timed if "- בן" in e.title]
+        tal_events = [e.title for e in timed if "- טל" in e.title]
+        all_titles = [f"• {e.title}" for e in timed]
+        debug = (
+            f"📅 אירועים היום ({len(timed)} ממוזמנים):\n" +
+            ("\n".join(all_titles) if all_titles else "אין") +
+            f"\n\nבן: {ben_events or 'אין'}\nטל: {tal_events or 'אין'}"
+        )
+        await update.message.reply_text(debug)
         await asyncio.wait_for(_check_parents_overlap(app, chat_id, today), timeout=25.0)
         await update.message.reply_text("✅ שלב 2 הושלם.")
     except asyncio.TimeoutError:
