@@ -457,8 +457,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # "בוקר טוב" → trigger morning routine
-    if text.strip() in ("בוקר טוב", "בוקר טוב!"):
-        asyncio.create_task(morning_routine(context.application))
+    if "בוקר טוב" in text:
+        await update.message.reply_text("🌅 טוען לוז היום...")
+        try:
+            await morning_routine(context.application)
+        except Exception as e:
+            logger.exception("morning_routine failed")
+            await update.message.reply_text(f"❌ שגיאה בטעינת הבוקר: {e}")
         return
 
     await update.effective_chat.send_action("typing")
