@@ -1043,15 +1043,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _run_with_custom_server(application: Application) -> None:
     """Run PTB + aiohttp so we can add a /cron endpoint alongside /webhook."""
 
-    # Register webhook with Telegram
-    await application.bot.set_webhook(
-        url=config.TELEGRAM_WEBHOOK_URL,
-        secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
-        allowed_updates=list(Update.ALL_TYPES),
-    )
-
     async with application:
         await application.start()
+
+        # Register webhook only after the bot is fully initialized
+        await application.bot.set_webhook(
+            url=config.TELEGRAM_WEBHOOK_URL,
+            secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+            allowed_updates=list(Update.ALL_TYPES),
+        )
+        logger.info("Webhook registered: %s", config.TELEGRAM_WEBHOOK_URL)
 
         async def handle_telegram(request: aiohttp_web.Request) -> aiohttp_web.Response:
             if config.TELEGRAM_WEBHOOK_SECRET:
