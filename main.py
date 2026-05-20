@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Union
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -19,6 +22,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    Updater,
     filters,
 )
 
@@ -1055,14 +1059,140 @@ async def post_init(application: Application) -> None:
     application.bot_data["scheduler"] = scheduler
     logger.info("Bot initialized. Morning routine handled by GitHub Actions cron.")
 
+    # Pre-register webhook early so EarlyBindUpdater's bootstrap call is fast.
+    # This runs during post_init (before port binding), giving us an early attempt
+    # at webhook registration that is independent of the bootstrap phase.
+    if config.TELEGRAM_WEBHOOK_URL:
+        try:
+            await asyncio.wait_for(
+                application.bot.set_webhook(
+                    url=config.TELEGRAM_WEBHOOK_URL,
+                    secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+                    allowed_updates=list(Update.ALL_TYPES),
+                    drop_pending_updates=False,
+                ),
+                timeout=10.0,
+            )
+            logger.info("Webhook pre-registered in post_init: %s", config.TELEGRAM_WEBHOOK_URL)
+        except asyncio.TimeoutError:
+            logger.warning("Webhook pre-registration timed out in post_init — will retry in bootstrap")
+        except Exception:
+            logger.exception("Webhook pre-registration failed in post_init — will retry in bootstrap")
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log unhandled errors and continue (don't crash on network errors)."""
     logger.error("Update %s caused error %s", update, context.error, exc_info=context.error)
 
 
+# ===================================================================
+# EarlyBindUpdater — fixes Cloud Run startup probe timing
+# ===================================================================
+class EarlyBindUpdater(Updater):
+    """Updater that binds the Tornado webhook port BEFORE calling Telegram's
+    set_webhook API.
+
+    PTB's default Updater calls _bootstrap (set_webhook) BEFORE serve_forever
+    (port binding).  On Cloud Run, the startup probe hits port 8080 immediately
+    after the container starts.  If the Telegram API is slow or temporarily
+    unreachable, _bootstrap can block for several seconds, keeping the port
+    closed long enough for Cloud Run to time out and kill the revision.
+
+    This subclass reverses the order: bind port first, then attempt bootstrap.
+    If bootstrap fails, the webhook may not be registered with Telegram, but
+    the bot still serves and the Cloud Run revision becomes healthy.  PTB's
+    error handler will log the failure.
+    """
+
+    async def _start_webhook(          # type: ignore[override]
+        self,
+        listen: str,
+        port: int,
+        url_path: str,
+        bootstrap_retries: int,
+        allowed_updates: Optional[list[str]],
+        cert: Optional[Union[str, Path]] = None,
+        key: Optional[Union[str, Path]] = None,
+        drop_pending_updates: Optional[bool] = None,
+        webhook_url: Optional[str] = None,
+        ready: Optional[asyncio.Event] = None,
+        ip_address: Optional[str] = None,
+        max_connections: int = 40,
+        secret_token: Optional[str] = None,
+        unix: Optional[Union[str, Path]] = None,
+    ) -> None:
+        from telegram.ext._utils.webhookhandler import WebhookAppClass, WebhookServer  # type: ignore[attr-defined]
+
+        if not url_path.startswith("/"):
+            url_path = f"/{url_path}"
+
+        app_handler = WebhookAppClass(url_path, self.bot, self.update_queue, secret_token)
+
+        ssl_ctx: Optional[ssl.SSLContext] = None
+        if cert and key:
+            ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_ctx.load_cert_chain(cert, key)
+
+        self._httpd = WebhookServer(listen, port, app_handler, ssl_ctx, unix)
+
+        # ── 1. Bind the port FIRST so Cloud Run startup probe gets a response ──
+        await self._httpd.serve_forever(ready=ready)
+        logger.info(
+            "EarlyBindUpdater: port %d bound — Cloud Run startup probe will succeed", port
+        )
+
+        # ── 2. Determine webhook URL ──
+        if not webhook_url:
+            webhook_url = self._gen_webhook_url(
+                protocol="https" if ssl_ctx else "http",
+                listen=listen,
+                port=port,
+                url_path=url_path,
+            )
+
+        # ── 3. Register webhook with Telegram (non-fatal if it fails) ──
+        try:
+            await asyncio.wait_for(
+                self._bootstrap(
+                    cert=Path(cert).read_bytes() if cert else None,
+                    max_retries=bootstrap_retries,
+                    drop_pending_updates=drop_pending_updates,
+                    webhook_url=webhook_url,
+                    allowed_updates=allowed_updates,
+                    ip_address=ip_address,
+                    max_connections=max_connections,
+                    secret_token=secret_token,
+                ),
+                timeout=30.0,
+            )
+            logger.info("EarlyBindUpdater: webhook registered with Telegram")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "EarlyBindUpdater: webhook registration timed out — "
+                "Telegram will not push updates until the webhook is set. "
+                "The bot will still serve incoming connections."
+            )
+        except Exception:
+            logger.exception(
+                "EarlyBindUpdater: webhook registration failed — "
+                "will retry on next restart"
+            )
+
+
 def build_application() -> Application:
-    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
+    # Use EarlyBindUpdater so that port 8080 opens before Telegram API calls.
+    # ApplicationBuilder.updater() accepts a pre-built Updater instance and uses
+    # its bot + update_queue for the application.
+    bot = Bot(token=config.TELEGRAM_TOKEN)
+    update_queue: asyncio.Queue = asyncio.Queue()
+    updater = EarlyBindUpdater(bot=bot, update_queue=update_queue)
+
+    app = (
+        ApplicationBuilder()
+        .updater(updater)
+        .post_init(post_init)
+        .build()
+    )
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("cron_morning", cmd_cron_morning))
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1075,12 +1205,14 @@ def build_application() -> Application:
 
 
 def main() -> None:
-    """Main entry point with automatic restart on crash."""
+    """Main entry point.
+
+    On Cloud Run the container MUST bind port 8080 quickly (before the startup
+    probe times out).  EarlyBindUpdater handles this by opening the Tornado
+    webhook port BEFORE calling Telegram's set_webhook API, so the startup probe
+    always succeeds even when the Telegram API is temporarily slow.
+    """
     import os
-    import time
-    retry_count = 0
-    max_retries = 10
-    retry_delay = 5  # seconds
 
     # On Cloud Run, webhook mode is required (run_webhook starts HTTP server on PORT).
     # Polling mode does not open a port, so Cloud Run health checks will fail.
@@ -1091,33 +1223,20 @@ def main() -> None:
             "Set TELEGRAM_WEBHOOK_URL=https://<service-url>/webhook"
         )
 
-    while True:
-        try:
-            app = build_application()
-            if config.TELEGRAM_WEBHOOK_URL:
-                logger.info("Starting in webhook mode on port %d", config.PORT)
-                app.run_webhook(
-                    listen="0.0.0.0",
-                    port=config.PORT,
-                    url_path="webhook",
-                    webhook_url=config.TELEGRAM_WEBHOOK_URL,
-                    secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
-                )
-            else:
-                logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
-                app.run_polling(allowed_updates=Update.ALL_TYPES)
-            # If we reach here, polling/webhook stopped normally
-            break
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            break
-        except Exception as e:
-            retry_count += 1
-            logger.error("Bot crashed: %s (retry %d/%d in %ds)", e, retry_count, max_retries, retry_delay)
-            if retry_count > max_retries:
-                logger.critical("Max retries exceeded, giving up")
-                raise
-            time.sleep(retry_delay)
+    app = build_application()
+    if config.TELEGRAM_WEBHOOK_URL:
+        logger.info("Starting in webhook mode (EarlyBindUpdater) on port %d", config.PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=config.PORT,
+            url_path="webhook",
+            webhook_url=config.TELEGRAM_WEBHOOK_URL,
+            secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+            drop_pending_updates=False,
+        )
+    else:
+        logger.info("Starting in polling mode (no TELEGRAM_WEBHOOK_URL set)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
