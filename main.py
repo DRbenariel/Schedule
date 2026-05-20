@@ -1039,7 +1039,7 @@ async def post_init(application: Application) -> None:
 
     caldav = CalDAVClient()
     try:
-        await asyncio.wait_for(caldav.connect(), timeout=30.0)
+        await asyncio.wait_for(caldav.connect(), timeout=5.0)
         logger.info("CalDAV connected at startup.")
     except asyncio.TimeoutError:
         logger.warning("CalDAV connect timed out at startup — will reconnect on first use.")
