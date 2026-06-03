@@ -597,7 +597,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 except Exception:
                     logger.exception("Logistics CalDAV write failed (non-fatal)")
             await query.edit_message_text(f"✅ נרשם: {answer}")
-            await _send_daily_summary(context, chat_id)
         return
 
     # ---------- pending-assignment answers (post-creation, asked at morning trigger) ----------
