@@ -235,6 +235,16 @@ def _format_summary(events: list[dict], today: date_type) -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main() -> None:
+    # DST guard: both cron lines fire year-round (GitHub cron can't be conditional).
+    # On a scheduled run, proceed only when the local Israel hour matches MORNING_HOUR
+    # so exactly one of the two cron lines runs per day. Manual (workflow_dispatch) always runs.
+    morning_hour = int(os.environ.get("MORNING_HOUR", "7"))
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+        local_hour = datetime.now(TIMEZONE).hour
+        if local_hour != morning_hour:
+            print(f"Skipping: local hour {local_hour} != MORNING_HOUR {morning_hour} (wrong-season cron line)")
+            return
+
     today = datetime.now(TIMEZONE).date()
     print(f"Morning job starting for {today}")
 

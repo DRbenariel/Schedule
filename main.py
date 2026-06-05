@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Union
@@ -348,20 +349,6 @@ async def _commit_event(
 # ===================================================================
 # Handlers
 # ===================================================================
-async def cmd_cron_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Triggered by GitHub Actions at 7am. Validates secret then runs morning routine."""
-    args = context.args or []
-    secret = args[0] if args else ""
-    if config.CRON_SECRET and secret != config.CRON_SECRET:
-        logger.warning("Unauthorized /cron_morning attempt")
-        return
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    await morning_routine(context.application)
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "שלום! אני בוט לוח השנה המשפחתי.\n"
@@ -448,9 +435,23 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(summary)
 
 
+_MORNING_DEBOUNCE_SECONDS = 120
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
+
+    # Dedup webhook retries: ignore an update_id we've already processed.
+    seen_ids: set = context.application.bot_data.setdefault("seen_update_ids", set())
+    if update.update_id in seen_ids:
+        return
+    seen_ids.add(update.update_id)
+    if len(seen_ids) > 1000:
+        # Bound memory: drop oldest ~half (sets are unordered, so just clear and re-seed).
+        seen_ids.clear()
+        seen_ids.add(update.update_id)
+
     user = update.effective_user
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
@@ -462,6 +463,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # "בוקר טוב" → trigger morning routine as background task (returns immediately)
     if "בוקר טוב" in text:
+        # Per-chat debounce: ignore re-triggers within the debounce window (double-taps).
+        last_triggers: dict = context.application.bot_data.setdefault("last_morning_trigger", {})
+        now_mono = time.monotonic()
+        last = last_triggers.get(chat_id)
+        if last is not None and (now_mono - last) < _MORNING_DEBOUNCE_SECONDS:
+            return
+        last_triggers[chat_id] = now_mono
+
         await update.message.reply_text("🌅 טוען לוז היום...")
         _app = context.application
         _chat_id = update.effective_chat.id
@@ -1193,7 +1202,6 @@ def build_application() -> Application:
         .build()
     )
     app.add_error_handler(error_handler)
-    app.add_handler(CommandHandler("cron_morning", cmd_cron_morning))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))

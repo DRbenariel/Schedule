@@ -2,7 +2,8 @@ name: Morning Routine
 
 on:
   schedule:
-    - cron: '30 18 * * *'  # TEST: 21:30 Israel Summer Time (UTC+3) — revert to '0 4 * * *' after confirming
+    - cron: '0 4 * * *'   # 07:00 IDT (summer, UTC+3)
+    - cron: '0 5 * * *'   # 07:00 IST (winter, UTC+2)
   workflow_dispatch:        # allow manual trigger from GitHub UI
 
 env:
