@@ -10,7 +10,7 @@ Deployed on Google Cloud Run; SQLite is used only for ephemeral conversation sta
 - `python-telegram-bot` v21+ (async, webhook mode in production / polling locally)
 - `caldav` + `icalendar` for iCloud
 - `google-generativeai` (Gemini 2.5 Flash — latest stable Flash model, swappable via `GEMINI_MODEL` env var or `config.GEMINI_MODEL`)
-- `APScheduler` for the daily 07:00 morning routine
+- `APScheduler` — imported but no longer used for the morning routine (kept for future in-process jobs). The daily 07:00 trigger now lives in **Cloud Scheduler → Cloud Run Job** (see "Morning routine" below).
 - `sqlite3` (stdlib) — no migration framework, schema in `db.SCHEMA`
 
 ## File structure (flat, by design)
@@ -85,14 +85,45 @@ retry once on JSON decode failure with a correction hint appended.
 - All `caldav` calls are wrapped in `asyncio.to_thread()` — the library is sync.
 
 ## Morning routine
-Triggers at `MORNING_HOUR:MORNING_MINUTE` Asia/Jerusalem (default 07:00) via APScheduler.
+Triggers at 07:00 Asia/Jerusalem (DST-aware) via **Cloud Scheduler → Cloud Run Job**.
 Sends 4-button question to `TELEGRAM_GROUP_CHAT_ID`. On answer:
 1. Save to `morning_answers`.
 2. Write all-day "לוגיסטיקה: …" event to iCloud (best-effort, non-fatal).
 3. Send today's calendar summary.
 
-If running on Cloud Run with min instances = 0, APScheduler won't fire from a cold container.
-Use Cloud Scheduler to POST a trigger at 07:00 instead, OR set min instances = 1.
+### Production architecture (as of June 2026)
+- **Cloud Scheduler job** `morning-routine-cron` (region `me-west1`, schedule `0 7 * * *`, timezone `Asia/Jerusalem`) POSTs to the Cloud Run Jobs `:run` API.
+- **Cloud Run Job** `morning-routine` (region `me-west1`) runs the same container image as the bot service, but with `command=python args=morning_job.py`.
+- Both run as the default Compute SA `217503293554-compute@developer.gserviceaccount.com`, which already has Secret Manager access for the 5 required secrets (`TELEGRAM_TOKEN`, `TELEGRAM_GROUP_CHAT_ID`, `ICLOUD_USER`, `ICLOUD_APP_PASSWORD`, `ICLOUD_CALENDAR_NAME`) — injected via `--set-secrets` at job-create time.
+- Why not GitHub Actions cron: free-tier `schedule` triggers are routinely 1-3h late and occasionally skipped entirely. Cloud Scheduler fires within seconds.
+- Why not APScheduler in-process: same module already had a `cmd_cron_morning` handler producing duplicates, and Cloud Run cold starts add risk. Single external trigger is the source of truth.
+
+### `morning_job.py` — standalone entry point
+- Loads config, builds calendar client + Telegram bot, runs the same routine the manual "בוקר טוב" handler runs.
+- Contains a defensive hour-guard (`GITHUB_EVENT_NAME == "schedule"` → only proceed if local IL hour matches `MORNING_HOUR`). Dead code under Cloud Scheduler but harmless and protects against re-enabling a GitHub workflow.
+
+### Manual trigger ("בוקר טוב" in the group)
+Defined inline in `handle_message` (main.py). Two-layer dedup added to prevent the historical "sent twice" bug:
+1. **Webhook-retry dedup** — bounded `seen_update_ids` set in `application.bot_data` rejects any `update_id` we've already processed (Telegram retries on slow ACK).
+2. **Per-chat debounce** — `last_morning_trigger[chat_id]` timestamp; re-triggers within `_MORNING_DEBOUNCE_SECONDS` (120s) are ignored.
+
+The original `cmd_cron_morning` Telegram command handler was **removed** in commit `72fb8d4` — it duplicated the scheduled fire and passed `CRON_SECRET` as a plaintext command arg.
+
+### Operating the cron
+```bash
+# Test-run the job now
+gcloud run jobs execute morning-routine --region=me-west1 --wait
+
+# Force-fire the scheduler now
+gcloud scheduler jobs run morning-routine-cron --location=me-west1
+
+# Pause / resume
+gcloud scheduler jobs pause morning-routine-cron --location=me-west1
+gcloud scheduler jobs resume morning-routine-cron --location=me-west1
+
+# Last run status
+gcloud scheduler jobs describe morning-routine-cron --location=me-west1
+```
 
 ## Running locally
 ```
@@ -129,6 +160,12 @@ Set `TELEGRAM_WEBHOOK_URL` to `https://<service-url>/webhook` and redeploy so th
 ## Do not touch
 - `.env` — never commit. `.gitignore` blocks it.
 - iCloud App-Specific Password — rotate via appleid.apple.com if leaked.
+- The Cloud Scheduler job and Cloud Run Job were set up via gcloud once — don't manually edit them in the console without updating CLAUDE.md.
+
+## Removed / decommissioned
+- `.github/workflows/morning_trigger.yml` (deleted in commit `7561760`) — GitHub Actions cron was unreliable; replaced by Cloud Scheduler.
+- GitHub repo secret `GCP_SA_KEY` — no longer referenced; safe to delete from repo settings.
+- `cmd_cron_morning` Telegram command handler in `main.py` (removed in commit `72fb8d4`) — duplicated the scheduled fire.
 
 ## Cost
 - Cloud Run free tier covers expected traffic (~50 msgs/day → ~1500 req/month).
